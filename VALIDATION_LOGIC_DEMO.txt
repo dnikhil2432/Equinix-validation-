@@ -1,0 +1,72 @@
+================================================================================
+VALIDATION LOGIC - DEMO SCRIPT (SHORT)
+================================================================================
+
+OVERALL FLOW
+------------
+We process each invoice line one by one. For each line we first try Quote (QLI)
+validation. If that doesn't apply, we run Rate Card (RC) validation.
+
+
+QUOTE VALIDATION (QLI)
+---------------------
+
+1. PO
+   Invoice line must have a PO number. We only look at quote lines with the
+   same PO. If there's no PO or no quote lines for that PO -> send the line to
+   Rate Card validation.
+
+2. IBX / site
+   Invoice line must have an IBX. We keep only quote lines whose site matches
+   that IBX. If there's no IBX or no matching quote lines -> Rate Card validation.
+
+3. Match by product
+   We match invoice to quote by item code or description (at least 3 words).
+   If we find an item-code match we use it; otherwise we use the best
+   description match. If nothing matches -> Rate Card validation.
+
+4. Price checks (on the matched quote line)
+   - No charge: If both unit price and LLA are zero -> Pass.
+   - Unit price: We compute the expected "current" unit price from the quote
+     using the invoice date and contract terms. Invoice unit price must not
+     exceed that price by more than the allowed tolerance (e.g. 5%) -> otherwise
+     Fail (Unit price).
+   - LLA: Expected LLA = that unit price x quantity x prorata factor. Invoice
+     LLA must not exceed that by more than the tolerance -> otherwise Fail (LLA).
+   - Quantity: Invoice quantity must not exceed quote quantity by more than the
+     quantity tolerance (e.g. 20%) -> otherwise Fail (Quantity).
+
+If all of these pass -> Quote validation passed.
+
+
+RATE CARD VALIDATION (RC)
+-------------------------
+
+Used only for lines that were not validated by quote (no PO, no quote match, or
+no product match).
+
+1. Effective window
+   Invoice service start date must fall in the rate card effective window
+   (e.g. Apr 1, 2025 - Mar 31, 2026).
+
+2. Find rate card line
+   We find a rate card row that matches: charge type (from description),
+   country, region, service start within effective dates, and IBX (all-IBX vs
+   specific/excluded IBX rules). ICB rows are skipped (handled manually).
+
+3. Price check
+   We take the rate card unit price as the allowed price.
+   - If both invoice and rate card unit price are zero -> Pass.
+   - If invoice unit price is greater than rate card price x (1 + tolerance)
+     -> Fail.
+   Otherwise -> Pass.
+
+
+SUMMARY ONE-LINER
+-----------------
+Quote: Match by PO, IBX, and item/description; then validate unit price, LLA, and
+quantity against the quote within tolerance. Rate card: For lines with no quote
+match, find a matching rate card row and check invoice unit price is within
+tolerance of the rate card price.
+
+================================================================================

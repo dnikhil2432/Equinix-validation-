@@ -1,5 +1,6 @@
 /**
- * Run validation against generated test files (Node). Reads xlsx + rate-card-types.json, runs runValidation, prints summary.
+ * Adds expected_result column to Base_Test_Invoice.xlsx:
+ * P = Passed validation, F = Failed validation (including Skipped/no match).
  */
 import XLSX from 'xlsx'
 import fs from 'fs'
@@ -30,14 +31,19 @@ const result = runValidation(baseData, quoteData, {
   rateCardConfig
 })
 
-console.log('Validation summary:')
-console.log('  Total:', result.totalLines)
-console.log('  Passed:', result.passedCount)
-console.log('  Failed:', result.failedCount)
-const failed = result.validationResults.filter(r => r.validation_result === 'Failed')
-if (failed.length > 0) {
-  console.log('\nFailed rows (first 5):')
-  failed.slice(0, 5).forEach(r => {
-    console.log('  Row', r.row, 'trx', r.trx_number, 'po', r.po_number, '-', r.remarks)
-  })
+function toExpectedResult(validationResult) {
+  return validationResult === 'Passed' ? 'P' : 'F'
 }
+
+for (let i = 0; i < baseData.length; i++) {
+  const vr = result.validationResults[i]?.validation_result ?? 'Skipped'
+  baseData[i].expected_result = toExpectedResult(vr)
+}
+
+const ws = XLSX.utils.json_to_sheet(baseData)
+const wb = XLSX.utils.book_new()
+XLSX.utils.book_append_sheet(wb, ws, 'Sheet1')
+XLSX.writeFile(wb, basePath)
+
+console.log('Added expected_result to', basePath)
+console.log('  Total:', result.totalLines, '| P:', result.passedCount, '| F:', result.failedCount + (result.totalLines - result.passedCount - result.failedCount))

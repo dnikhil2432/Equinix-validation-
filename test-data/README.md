@@ -12,6 +12,8 @@ Three Excel files for **positive and negative** validation scenarios, including 
 
 ## Base file scenarios (56 rows)
 
+Base file includes **billing_from** and **billing_till** for prorata factor calculation: PF = (billing_till − billing_from) / days_in_month. When present, validation uses PF in ELLA (Expected LLA); results show **ILI Billing From**, **ILI Billing Till**, and **Prorata Factor** columns.
+
 - **Rows 1–20:** **Positive (quote)** – PO001–PO005, sites DA1/CH1/AM2/DA2/CH2, SVC-001/SVC-002; should **Pass** when validated with Quote file.
 - **Rows 21–32:** **Negative (quote)** – No PO (PO999), wrong price, excess quantity, zero charge; expect **Failed** or **For Rate Card Validation**.
 - **Rows 33–55:** **Rate card** – No quote (PO-RC); descriptions: AC Power kVA, Metered Power kVA, Smart Hands NRC, Cabinet Installation, Cage Installation, Cross Connect, Equinix Precision Time. Rows 52–54 have missing **Service Start Date** (skipped). Row 54 is zero price (pass). Row 56 is **AC Power kVA** with high price (rate card fail).
@@ -28,6 +30,7 @@ Three Excel files for **positive and negative** validation scenarios, including 
 - **u_country / u_region:** United States / Americas (and one UK/EMEA).
 - **u_effective_from / effective_till:** 2024-01-01 to 2026-12-31.
 - **u_pricekva, u_rate, u_nrc** and Precision Time fields set for price validation.
+- **Field-based matching** (same as u_minimum_cabinet_density): **u_parameter1**, **u_goods_services_category**, **u_amps**, **u_volt** are included. Rows with these fields must have the ILI description contain the rate card value (e.g. Power Install NRC with u_amps=30, u_volt=208; Interconnection with u_parameter1=Protected; Equinix Internet Access with u_goods_services_category and u_parameter1).
 - **2 rows** with **u_icb_flag: true** – these are skipped in rate card validation.
 
 ## How to run

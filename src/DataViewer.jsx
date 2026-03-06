@@ -11,6 +11,183 @@ import {
 } from '@tanstack/react-table'
 import './DataViewer.css'
 
+// --- Invoice consolidation: unique key and column variants ---
+const INVOICE_KEY_COLUMNS = [
+  'TRX_NUMBER',
+  'BILLING_AGREEMENT',
+  'SERIAL_NUMBER',
+  'RECURRING_CHARGE_FROM_DATE',
+  'RECURRING_CHARGE_TO_DATE',
+]
+
+const QUANTITY_VARIANTS = ['QUANTITY', 'quantity', 'Quantity', 'QTY', 'qty']
+const UNIT_SELLING_PRICE_VARIANTS = ['UNIT_SELLING_PRICE', 'unit_selling_price', 'Unit Selling Price', 'UNIT_PRICE', 'unit_price']
+const LLA_VARIANTS = ['LINE_LEVEL_AMOUNT', 'line_level_amount', 'Line Level Amount', 'LLA', 'lla', 'ELLA', 'ella', 'EFFECTIVE_LLA', 'effective_lla']
+const CHARGE_TYPE_VARIANTS = ['CHARGE_TYPE', 'charge_type', 'Charge Type', 'CHARGE_TYPE_ILI', 'charge_type_ili']
+
+function normalizeKeyName(name) {
+  return String(name ?? '')
+    .replace(/\s+/g, '_')
+    .toLowerCase()
+}
+
+function findColumnKey(headerKeys, variants) {
+  const normalized = headerKeys.map((k) => ({ original: k, norm: normalizeKeyName(k) }))
+  for (const v of variants) {
+    const vNorm = normalizeKeyName(v)
+    const found = normalized.find(({ norm }) => norm === vNorm)
+    if (found) return found.original
+  }
+  return null
+}
+
+function getNum(row, colKey) {
+  if (!row || colKey == null) return NaN
+  const val = row[colKey]
+  if (val == null || val === '') return NaN
+  const cleaned = String(val).replace(/[$,]/g, '')
+  return parseFloat(cleaned)
+}
+
+function getStr(row, colKey) {
+  if (!row || colKey == null) return ''
+  const val = row[colKey]
+  return val != null && val !== '' ? String(val).trim() : ''
+}
+
+function getCompositeKey(row, keyCols) {
+  return keyCols.map((col) => String(row[col] ?? '').trim()).join('|')
+}
+
+function mergeTwoRows(row1, row2, colKeys) {
+  const { quantity: qtyKey, unit_selling_price: priceKey, lla: llaKey, charge_type: chargeKey } = colKeys
+  const qty1 = getNum(row1, qtyKey)
+  const qty2 = getNum(row2, qtyKey)
+  const price1 = getNum(row1, priceKey)
+  const price2 = getNum(row2, priceKey)
+  const lla1 = getNum(row1, llaKey)
+  const lla2 = getNum(row2, llaKey)
+  const absQty1 = Math.abs(qty1)
+  const absQty2 = Math.abs(qty2)
+
+  const sign1 = qty1 >= 0 ? 1 : -1
+  const sign2 = qty2 >= 0 ? 1 : -1
+  const adjustedPrice1 = sign1 * (isNaN(price1) ? 0 : price1)
+  const adjustedPrice2 = sign2 * (isNaN(price2) ? 0 : price2)
+  const consolidatedPrice = adjustedPrice1 + adjustedPrice2
+  const consolidatedLla = (isNaN(lla1) ? 0 : lla1) + (isNaN(lla2) ? 0 : lla2)
+  const baseRow = qty1 >= 0 ? { ...row1 } : { ...row2 }
+  const consolidatedQty = absQty1
+
+  baseRow[qtyKey] = consolidatedQty
+  baseRow[priceKey] = consolidatedPrice
+  if (llaKey) baseRow[llaKey] = consolidatedLla
+  if (chargeKey) {
+    baseRow[chargeKey] = getStr(qty1 >= 0 ? row1 : row2, chargeKey)
+  }
+  return baseRow
+}
+
+function analyzeInvoiceConsolidation(rawData) {
+  if (!rawData || rawData.length === 0) return { exceptionRows: [], consolidatedRows: [], keyColumnNames: null, columnKeys: null }
+
+  const headerKeys = Object.keys(rawData[0] || {})
+  const keyColumnNames = INVOICE_KEY_COLUMNS.map((k) => {
+    const norm = normalizeKeyName(k)
+    const found = headerKeys.find((h) => normalizeKeyName(h) === norm)
+    return found || null
+  })
+  if (keyColumnNames.some((k) => !k)) {
+    return { exceptionRows: [], consolidatedRows: [], keyColumnNames: null, columnKeys: null }
+  }
+
+  const qtyKey = findColumnKey(headerKeys, QUANTITY_VARIANTS)
+  const priceKey = findColumnKey(headerKeys, UNIT_SELLING_PRICE_VARIANTS)
+  let llaKey = findColumnKey(headerKeys, LLA_VARIANTS)
+  if (!llaKey) {
+    const fallback = headerKeys.find((k) => {
+      const n = normalizeKeyName(k)
+      return n.includes('line_level') || n === 'lla'
+    })
+    if (fallback) llaKey = fallback
+  }
+  const chargeKey = findColumnKey(headerKeys, CHARGE_TYPE_VARIANTS)
+  const columnKeys = { quantity: qtyKey, unit_selling_price: priceKey, lla: llaKey, charge_type: chargeKey }
+
+  const groups = new Map()
+  rawData.forEach((row, index) => {
+    const key = getCompositeKey(row, keyColumnNames)
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push({ row, index })
+  })
+
+  const exceptionRows = []
+  const consolidatedRows = []
+
+  groups.forEach((entries) => {
+    const rows = entries.map((e) => e.row)
+    if (rows.length >= 3) {
+      exceptionRows.push(...rows)
+      return
+    }
+    if (rows.length === 2) {
+      const qty1 = getNum(rows[0], qtyKey)
+      const qty2 = getNum(rows[1], qtyKey)
+      const abs1 = Math.abs(qty1)
+      const abs2 = Math.abs(qty2)
+      if (abs1 !== abs2) {
+        exceptionRows.push(...rows)
+        return
+      }
+      consolidatedRows.push(mergeTwoRows(rows[0], rows[1], columnKeys))
+      return
+    }
+    consolidatedRows.push(rows[0])
+  })
+
+  return {
+    exceptionRows,
+    consolidatedRows,
+    keyColumnNames,
+    columnKeys,
+  }
+}
+
+function downloadAsCSV(rows, columns, filename) {
+  if (rows.length === 0) return
+  const header = columns.join(',')
+  const csvRows = rows.map((row) =>
+    columns
+      .map((col) => {
+        const value = row[col]
+        if (value === null || value === undefined) return ''
+        const s = String(value)
+        if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`
+        return s
+      })
+      .join(',')
+  )
+  const csv = `${header}\n${csvRows.join('\n')}`
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = filename
+  link.style.visibility = 'hidden'
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(link.href)
+}
+
+function downloadAsExcel(rows, columns, filename) {
+  if (rows.length === 0) return
+  const wsData = [columns, ...rows.map((row) => columns.map((c) => row[c] ?? ''))]
+  const ws = XLSX.utils.aoa_to_sheet(wsData)
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, 'Sheet1')
+  XLSX.writeFile(wb, filename)
+}
+
 // Column Filter Component
 function ColumnFilter({ column }) {
   const columnFilterValue = column.getFilterValue()
@@ -37,6 +214,7 @@ function DataViewer() {
   const [loading, setLoading] = useState(false)
   const [filterMode, setFilterMode] = useState('all') // 'all', 'duplicates', 'unique'
   const [duplicateStats, setDuplicateStats] = useState(null)
+  const [invoiceConsolidation, setInvoiceConsolidation] = useState(null)
 
   // Analyze duplicates based on primary key columns
   const analyzeDuplicates = (rawData) => {
@@ -137,53 +315,53 @@ function DataViewer() {
             skipEmptyLines: true,
             complete: (results) => {
               if (results.data.length > 0) {
-                const { enrichedData, stats } = analyzeDuplicates(results.data)
-                
-                const cols = Object.keys(results.data[0]).map((key) => ({
-                  accessorKey: key,
-                  header: key,
-                  cell: (info) => info.getValue(),
-                  enableColumnFilter: true,
-                  enableSorting: true,
-                }))
-                
-                // Add duplicate indicator column
-                cols.unshift({
-                  accessorKey: '_duplicateCount',
-                  header: 'Occurrence Count',
-                  enableColumnFilter: true,
-                  enableSorting: true,
-                  cell: (info) => {
-                    const count = info.getValue()
-                    return count > 1 ? (
-                      <span style={{ 
-                        background: '#ff4444', 
-                        color: 'white', 
-                        padding: '6px 12px', 
-                        borderRadius: '6px',
-                        fontWeight: 'bold',
-                        fontSize: '0.95rem',
-                        display: 'inline-block',
-                        minWidth: '40px',
-                        textAlign: 'center'
-                      }}>
-                        {count}
-                      </span>
-                    ) : (
-                      <span style={{ 
-                        color: '#4caf50',
-                        fontWeight: '600',
-                        fontSize: '0.95rem'
-                      }}>
-                        {count}
-                      </span>
-                    )
-                  },
-                })
-                
-                setColumns(cols)
-                setData(enrichedData)
-                setDuplicateStats(stats)
+                const rawData = results.data
+                const consolidation = analyzeInvoiceConsolidation(rawData)
+                const headerKeys = Object.keys(rawData[0]).filter((k) => !k.startsWith('_'))
+
+                if (consolidation.keyColumnNames) {
+                  setInvoiceConsolidation({
+                    exceptionRows: consolidation.exceptionRows,
+                    consolidatedRows: consolidation.consolidatedRows,
+                  })
+                  setDuplicateStats(null)
+                  const cols = headerKeys.map((key) => ({
+                    accessorKey: key,
+                    header: key,
+                    cell: (info) => info.getValue(),
+                    enableColumnFilter: true,
+                    enableSorting: true,
+                  }))
+                  setColumns(cols)
+                  setData(consolidation.consolidatedRows)
+                } else {
+                  setInvoiceConsolidation(null)
+                  const { enrichedData, stats } = analyzeDuplicates(rawData)
+                  const cols = Object.keys(rawData[0]).map((key) => ({
+                    accessorKey: key,
+                    header: key,
+                    cell: (info) => info.getValue(),
+                    enableColumnFilter: true,
+                    enableSorting: true,
+                  }))
+                  cols.unshift({
+                    accessorKey: '_duplicateCount',
+                    header: 'Occurrence Count',
+                    enableColumnFilter: true,
+                    enableSorting: true,
+                    cell: (info) => {
+                      const count = info.getValue()
+                      return count > 1 ? (
+                        <span style={{ background: '#ff4444', color: 'white', padding: '6px 12px', borderRadius: '6px', fontWeight: 'bold', fontSize: '0.95rem', display: 'inline-block', minWidth: '40px', textAlign: 'center' }}>{count}</span>
+                      ) : (
+                        <span style={{ color: '#4caf50', fontWeight: '600', fontSize: '0.95rem' }}>{count}</span>
+                      )
+                    },
+                  })
+                  setColumns(cols)
+                  setData(enrichedData)
+                  setDuplicateStats(stats)
+                }
               }
               setLoading(false)
             },
@@ -201,53 +379,53 @@ function DataViewer() {
           const jsonData = XLSX.utils.sheet_to_json(worksheet)
 
           if (jsonData.length > 0) {
-            const { enrichedData, stats } = analyzeDuplicates(jsonData)
-            
-            const cols = Object.keys(jsonData[0]).map((key) => ({
-              accessorKey: key,
-              header: key,
-              cell: (info) => info.getValue(),
-              enableColumnFilter: true,
-              enableSorting: true,
-            }))
-            
-            // Add duplicate indicator column
-            cols.unshift({
-              accessorKey: '_duplicateCount',
-              header: 'Occurrence Count',
-              enableColumnFilter: true,
-              enableSorting: true,
-              cell: (info) => {
-                const count = info.getValue()
-                return count > 1 ? (
-                  <span style={{ 
-                    background: '#ff4444', 
-                    color: 'white', 
-                    padding: '6px 12px', 
-                    borderRadius: '6px',
-                    fontWeight: 'bold',
-                    fontSize: '0.95rem',
-                    display: 'inline-block',
-                    minWidth: '40px',
-                    textAlign: 'center'
-                  }}>
-                    {count}
-                  </span>
-                ) : (
-                  <span style={{ 
-                    color: '#4caf50',
-                    fontWeight: '600',
-                    fontSize: '0.95rem'
-                  }}>
-                    {count}
-                  </span>
-                )
-              },
-            })
-            
-            setColumns(cols)
-            setData(enrichedData)
-            setDuplicateStats(stats)
+            const rawData = jsonData
+            const consolidation = analyzeInvoiceConsolidation(rawData)
+            const headerKeys = Object.keys(rawData[0]).filter((k) => !k.startsWith('_'))
+
+            if (consolidation.keyColumnNames) {
+              setInvoiceConsolidation({
+                exceptionRows: consolidation.exceptionRows,
+                consolidatedRows: consolidation.consolidatedRows,
+              })
+              setDuplicateStats(null)
+              const cols = headerKeys.map((key) => ({
+                accessorKey: key,
+                header: key,
+                cell: (info) => info.getValue(),
+                enableColumnFilter: true,
+                enableSorting: true,
+              }))
+              setColumns(cols)
+              setData(consolidation.consolidatedRows)
+            } else {
+              setInvoiceConsolidation(null)
+              const { enrichedData, stats } = analyzeDuplicates(rawData)
+              const cols = Object.keys(rawData[0]).map((key) => ({
+                accessorKey: key,
+                header: key,
+                cell: (info) => info.getValue(),
+                enableColumnFilter: true,
+                enableSorting: true,
+              }))
+              cols.unshift({
+                accessorKey: '_duplicateCount',
+                header: 'Occurrence Count',
+                enableColumnFilter: true,
+                enableSorting: true,
+                cell: (info) => {
+                  const count = info.getValue()
+                  return count > 1 ? (
+                    <span style={{ background: '#ff4444', color: 'white', padding: '6px 12px', borderRadius: '6px', fontWeight: 'bold', fontSize: '0.95rem', display: 'inline-block', minWidth: '40px', textAlign: 'center' }}>{count}</span>
+                  ) : (
+                    <span style={{ color: '#4caf50', fontWeight: '600', fontSize: '0.95rem' }}>{count}</span>
+                  )
+                },
+              })
+              setColumns(cols)
+              setData(enrichedData)
+              setDuplicateStats(stats)
+            }
           }
           setLoading(false)
         } else {
@@ -280,47 +458,41 @@ function DataViewer() {
     return data
   }, [data, filterMode])
 
-  // Export data to CSV
+  const exportColumns = useMemo(
+    () => columns.map((col) => col.accessorKey).filter((key) => !key.startsWith('_')),
+    [columns]
+  )
+
+  const downloadExceptionFile = () => {
+    if (!invoiceConsolidation || invoiceConsolidation.exceptionRows.length === 0) return
+    const base = fileName ? fileName.replace(/\.[^.]+$/, '') : 'invoice'
+    const ext = fileName && /\.(xlsx|xls)$/i.test(fileName) ? (fileName.endsWith('.xls') ? 'xls' : 'xlsx') : 'csv'
+    const name = `${base}_exception.${ext}`
+    if (ext === 'csv') {
+      downloadAsCSV(invoiceConsolidation.exceptionRows, exportColumns, name)
+    } else {
+      downloadAsExcel(invoiceConsolidation.exceptionRows, exportColumns, name)
+    }
+  }
+
+  const downloadConsolidatedFile = () => {
+    if (!invoiceConsolidation || invoiceConsolidation.consolidatedRows.length === 0) return
+    const base = fileName ? fileName.replace(/\.[^.]+$/, '') : 'invoice'
+    const ext = fileName && /\.(xlsx|xls)$/i.test(fileName) ? (fileName.endsWith('.xls') ? 'xls' : 'xlsx') : 'csv'
+    const name = `${base}_consolidated.${ext}`
+    if (ext === 'csv') {
+      downloadAsCSV(invoiceConsolidation.consolidatedRows, exportColumns, name)
+    } else {
+      downloadAsExcel(invoiceConsolidation.consolidatedRows, exportColumns, name)
+    }
+  }
+
+  // Export data to CSV (for non-invoice / legacy duplicate view)
   const exportToCSV = () => {
     if (filteredData.length === 0) return
-
-    // Get original column names (excluding internal columns)
-    const originalColumns = columns
-      .map(col => col.accessorKey)
-      .filter(key => !key.startsWith('_'))
-
-    // Create CSV header
-    const header = originalColumns.join(',')
-
-    // Create CSV rows
-    const rows = filteredData.map(row => {
-      return originalColumns.map(col => {
-        const value = row[col]
-        // Handle values with commas, quotes, or newlines
-        if (value === null || value === undefined) return ''
-        const stringValue = String(value)
-        if (stringValue.includes(',') || stringValue.includes('"') || stringValue.includes('\n')) {
-          return `"${stringValue.replace(/"/g, '""')}"`
-        }
-        return stringValue
-      }).join(',')
-    }).join('\n')
-
-    const csv = `${header}\n${rows}`
-
-    // Create download link
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-    const link = document.createElement('a')
-    const url = URL.createObjectURL(blob)
-    
-    const filterLabel = filterMode === 'duplicates' ? 'duplicates' : 
-                       filterMode === 'unique' ? 'unique' : 'all'
-    link.setAttribute('href', url)
-    link.setAttribute('download', `${fileName.split('.')[0]}_${filterLabel}.csv`)
-    link.style.visibility = 'hidden'
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
+    const filterLabel = filterMode === 'duplicates' ? 'duplicates' : filterMode === 'unique' ? 'unique' : 'all'
+    const base = fileName ? fileName.replace(/\.[^.]+$/, '') : 'export'
+    downloadAsCSV(filteredData, exportColumns, `${base}_${filterLabel}.csv`)
   }
 
   const table = useReactTable({
@@ -387,93 +559,151 @@ function DataViewer() {
 
       {!loading && data.length > 0 && (
         <>
-          <div className="duplicate-analysis">
-            <h2>Duplicate Analysis (Showing Deduplicated Data)</h2>
-            <p className="analysis-subtitle">
-              Primary Key: SERIAL_NUMBER + TRX_NUMBER + LINE_NUMBER
-              <br />
-              <strong>Note:</strong> Each unique primary key combination is shown only once with its occurrence count
-            </p>
-            <div className="stats-grid">
-              <div className="stat-card">
-                <div className="stat-icon">📊</div>
-                <div className="stat-content">
-                  <span className="stat-label">Total Records</span>
-                  <span className="stat-value">{duplicateStats?.totalRecords.toLocaleString()}</span>
-                </div>
-              </div>
-              <div className="stat-card">
-                <div className="stat-icon">✅</div>
-                <div className="stat-content">
-                  <span className="stat-label">Unique Records</span>
-                  <span className="stat-value">{duplicateStats?.uniqueRecords.toLocaleString()}</span>
-                </div>
-              </div>
-              <div className="stat-card duplicate">
-                <div className="stat-icon">🔄</div>
-                <div className="stat-content">
-                  <span className="stat-label">Duplicate Records</span>
-                  <span className="stat-value">{duplicateStats?.duplicateRecords.toLocaleString()}</span>
-                </div>
-              </div>
-              <div className="stat-card">
-                <div className="stat-icon">📦</div>
-                <div className="stat-content">
-                  <span className="stat-label">Duplicate Groups</span>
-                  <span className="stat-value">{duplicateStats?.duplicateGroups.toLocaleString()}</span>
-                </div>
-              </div>
-            </div>
-
-            {duplicateStats?.duplicateGroups > 0 && (
-              <div className="duplicate-summary">
-                <h3>Top 5 Duplicate Groups</h3>
-                <div className="duplicate-groups">
-                  {duplicateStats.duplicateGroupDetails.slice(0, 5).map((group, idx) => (
-                    <div key={idx} className="duplicate-group-item">
-                      <span className="group-rank">#{idx + 1}</span>
-                      <span className="group-count">{group.count} occurrences</span>
+          {invoiceConsolidation ? (
+            <>
+              <div className="duplicate-analysis">
+                <h2>Invoice consolidation</h2>
+                <p className="analysis-subtitle">
+                  Unique key: TRX_NUMBER, BILLING_AGREEMENT, SERIAL_NUMBER, RECURRING_CHARGE_FROM_DATE, RECURRING_CHARGE_TO_DATE
+                  <br />
+                  Table shows <strong>consolidated</strong> rows (1 or 2 line items per key; 2 lines merged when same |quantity|). Exception rows (3+ per key or 2 with different |quantity|) can be downloaded below.
+                </p>
+                <div className="stats-grid">
+                  <div className="stat-card">
+                    <div className="stat-icon">📋</div>
+                    <div className="stat-content">
+                      <span className="stat-label">Consolidated rows</span>
+                      <span className="stat-value">{invoiceConsolidation.consolidatedRows.length.toLocaleString()}</span>
                     </div>
-                  ))}
+                  </div>
+                  <div className="stat-card duplicate">
+                    <div className="stat-icon">⚠️</div>
+                    <div className="stat-content">
+                      <span className="stat-label">Exception rows</span>
+                      <span className="stat-value">{invoiceConsolidation.exceptionRows.length.toLocaleString()}</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="filter-controls" style={{ marginTop: '1rem' }}>
+                  <button
+                    type="button"
+                    className="export-btn"
+                    onClick={downloadConsolidatedFile}
+                    disabled={invoiceConsolidation.consolidatedRows.length === 0}
+                  >
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                      <polyline points="7 10 12 15 17 10" />
+                      <line x1="12" y1="15" x2="12" y2="3" />
+                    </svg>
+                    Download consolidated file
+                  </button>
+                  <button
+                    type="button"
+                    className="export-btn"
+                    onClick={downloadExceptionFile}
+                    disabled={invoiceConsolidation.exceptionRows.length === 0}
+                    style={{ marginLeft: '0.75rem' }}
+                  >
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                      <polyline points="7 10 12 15 17 10" />
+                      <line x1="12" y1="15" x2="12" y2="3" />
+                    </svg>
+                    Download exception file
+                  </button>
                 </div>
               </div>
-            )}
-          </div>
-
-          <div className="filter-controls">
-            <div className="filter-buttons">
-              <button
-                className={`filter-btn ${filterMode === 'all' ? 'active' : ''}`}
-                onClick={() => setFilterMode('all')}
-              >
-                All Unique Keys ({data.length.toLocaleString()})
-              </button>
-              <button
-                className={`filter-btn ${filterMode === 'duplicates' ? 'active' : ''}`}
-                onClick={() => setFilterMode('duplicates')}
-              >
-                Has Duplicates ({duplicateStats?.duplicateGroups.toLocaleString()})
-              </button>
-              <button
-                className={`filter-btn ${filterMode === 'unique' ? 'active' : ''}`}
-                onClick={() => setFilterMode('unique')}
-              >
-                No Duplicates ({(duplicateStats?.uniqueRecords - duplicateStats?.duplicateGroups).toLocaleString()})
-              </button>
-            </div>
-            <button className="export-btn" onClick={exportToCSV}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                <polyline points="7 10 12 15 17 10" />
-                <line x1="12" y1="15" x2="12" y2="3" />
-              </svg>
-              Export {filterMode === 'all' ? 'All' : filterMode === 'duplicates' ? 'Duplicates' : 'Unique'} to CSV
-            </button>
-          </div>
+            </>
+          ) : (
+            <>
+              <div className="duplicate-analysis">
+                <h2>Duplicate Analysis (Showing Deduplicated Data)</h2>
+                <p className="analysis-subtitle">
+                  Primary Key: SERIAL_NUMBER + TRX_NUMBER + LINE_NUMBER
+                  <br />
+                  <strong>Note:</strong> Invoice key columns not found. Each unique primary key combination is shown once with its occurrence count.
+                </p>
+                <div className="stats-grid">
+                  <div className="stat-card">
+                    <div className="stat-icon">📊</div>
+                    <div className="stat-content">
+                      <span className="stat-label">Total Records</span>
+                      <span className="stat-value">{duplicateStats?.totalRecords.toLocaleString()}</span>
+                    </div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="stat-icon">✅</div>
+                    <div className="stat-content">
+                      <span className="stat-label">Unique Records</span>
+                      <span className="stat-value">{duplicateStats?.uniqueRecords.toLocaleString()}</span>
+                    </div>
+                  </div>
+                  <div className="stat-card duplicate">
+                    <div className="stat-icon">🔄</div>
+                    <div className="stat-content">
+                      <span className="stat-label">Duplicate Records</span>
+                      <span className="stat-value">{duplicateStats?.duplicateRecords.toLocaleString()}</span>
+                    </div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="stat-icon">📦</div>
+                    <div className="stat-content">
+                      <span className="stat-label">Duplicate Groups</span>
+                      <span className="stat-value">{duplicateStats?.duplicateGroups.toLocaleString()}</span>
+                    </div>
+                  </div>
+                </div>
+                {duplicateStats?.duplicateGroups > 0 && (
+                  <div className="duplicate-summary">
+                    <h3>Top 5 Duplicate Groups</h3>
+                    <div className="duplicate-groups">
+                      {duplicateStats.duplicateGroupDetails.slice(0, 5).map((group, idx) => (
+                        <div key={idx} className="duplicate-group-item">
+                          <span className="group-rank">#{idx + 1}</span>
+                          <span className="group-count">{group.count} occurrences</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="filter-controls">
+                <div className="filter-buttons">
+                  <button
+                    className={`filter-btn ${filterMode === 'all' ? 'active' : ''}`}
+                    onClick={() => setFilterMode('all')}
+                  >
+                    All Unique Keys ({data.length.toLocaleString()})
+                  </button>
+                  <button
+                    className={`filter-btn ${filterMode === 'duplicates' ? 'active' : ''}`}
+                    onClick={() => setFilterMode('duplicates')}
+                  >
+                    Has Duplicates ({duplicateStats?.duplicateGroups.toLocaleString()})
+                  </button>
+                  <button
+                    className={`filter-btn ${filterMode === 'unique' ? 'active' : ''}`}
+                    onClick={() => setFilterMode('unique')}
+                  >
+                    No Duplicates ({(duplicateStats?.uniqueRecords - duplicateStats?.duplicateGroups).toLocaleString()})
+                  </button>
+                </div>
+                <button type="button" className="export-btn" onClick={exportToCSV}>
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="7 10 12 15 17 10" />
+                    <line x1="12" y1="15" x2="12" y2="3" />
+                  </svg>
+                  Export {filterMode === 'all' ? 'All' : filterMode === 'duplicates' ? 'Duplicates' : 'Unique'} to CSV
+                </button>
+              </div>
+            </>
+          )}
 
           <div className="stats-bar">
             <div className="stat">
-              <span className="stat-label">Showing Unique Keys:</span>
+              <span className="stat-label">{invoiceConsolidation ? 'Showing consolidated rows:' : 'Showing Unique Keys:'}</span>
               <span className="stat-value">{filteredData.length.toLocaleString()}</span>
             </div>
             {(globalFilter || columnFilters.length > 0) && (
