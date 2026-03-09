@@ -405,7 +405,7 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
       if (itemCodeMatches[i].matchCount > best.matchCount) best = itemCodeMatches[i]
     }
     // In quotation validation desc match must be > 60% else ILI goes to rate card validation
-    if (best.matchCount > 90) {
+    if (best.matchCount > 60) {
       selectedQLI = best.qli
     }
   } else {
