@@ -2,7 +2,7 @@
  * Charge description matching from CD Validation repo.
  * Uses tokens.json (key phrases) and valueTokens.json (number+unit patterns).
  * parseSentence() extracts: contains (key phrases), value_matches (e.g. "10 Gbps", "55 kVA"), special_matches (dates, UUIDs), not_contains.
- * Similarity = (Jaccard(contains_A, contains_B) + Jaccard(value_matches_A, value_matches_B)) / 2.
+ * Similarity = 70% * Jaccard(contains) + 30% * Jaccard(value_matches).
  */
 import tokens from './data/tokens.json'
 import valueTokens from './data/valueTokens.json'
@@ -108,17 +108,24 @@ export function calculateJaccardSimilarity(keysA, keysB) {
 }
 
 /** Quote validation: description match must be strictly more than this % else ILI goes to rate card validation. */
-const CD_PASS_THRESHOLD = 60
+const CD_PASS_THRESHOLD = 80
+
+/** Weight for value_matches in description match percentage: 30%; contains gets 70%. */
+const VALUE_MATCHES_WEIGHT = 0.50
+const CONTAINS_WEIGHT = 1 - VALUE_MATCHES_WEIGHT
 
 /**
- * Overall CD similarity: average of Jaccard(contains) and Jaccard(value_matches).
+ * Overall CD similarity: weighted average of Jaccard(contains) and Jaccard(value_matches).
+ * value_matches has 30% weight, contains has 70%.
  * Returns { score, passes, parsedA, parsedB }.
- * passes: true only when score > CD_PASS_THRESHOLD (i.e. > 60%); otherwise ILI is sent to rate card validation.
+ * passes: true only when score > CD_PASS_THRESHOLD; otherwise ILI is sent to rate card validation.
  */
 export function calculateCDSimilarity(iliDesc, qliDesc) {
   const parsedA = parseSentence(iliDesc)
   const parsedB = parseSentence(qliDesc)
-  const score = calculateJaccardSimilarity(parsedA.contains, parsedB.contains)
+  const jaccardContains = calculateJaccardSimilarity(parsedA.contains, parsedB.contains)
+  const jaccardValueMatches = calculateJaccardSimilarity(parsedA.value_matches, parsedB.value_matches)
+  const score = Number((CONTAINS_WEIGHT * jaccardContains + VALUE_MATCHES_WEIGHT * jaccardValueMatches).toFixed(2))
   const passes = score > CD_PASS_THRESHOLD
   return { score, passes, parsedA, parsedB }
 }

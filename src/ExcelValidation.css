@@ -198,6 +198,23 @@
   font-size: 1rem;
   margin: 0;
   word-break: break-word;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.auto-loaded-badge {
+  display: inline-flex;
+  align-items: center;
+  background: #e8f5e9;
+  color: #2e7d32;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.2rem 0.6rem;
+  border-radius: 20px;
+  border: 1px solid #a5d6a7;
+  white-space: nowrap;
 }
 
 .file-stats {
@@ -1108,6 +1125,32 @@
 .results-table tbody tr:hover .remarks-cell {
   white-space: normal;
   word-wrap: break-word;
+}
+
+/* Quote skip: stage + remarks visible without scrolling to far right */
+.quote-skip-stage-cell {
+  max-width: 220px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #b45309;
+  vertical-align: top;
+}
+.quote-skip-reason-cell {
+  max-width: 320px;
+  min-width: 180px;
+  vertical-align: top;
+  text-align: left;
+}
+.quote-skip-reason-text {
+  display: block;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  color: #444;
+}
+.results-table tbody tr:hover .quote-skip-reason-cell .quote-skip-reason-text {
+  white-space: pre-wrap;
 }
 
 .status-badge {

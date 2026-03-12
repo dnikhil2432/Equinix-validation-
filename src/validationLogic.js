@@ -3,17 +3,19 @@
  * Two-file mode: Base file (Invoice) + Quote file (QLI).
  * Charge description matching uses CD Validation (tokens.json + valueTokens.json): parseSentence + Jaccard on contains and value_matches.
  */
-import { validateWithRateCard, formatDateForDisplay } from './rateCardValidation.js'
+import { validateWithRateCard, formatDateForDisplay, parseDate } from './rateCardValidation.js'
 import { calculateCDSimilarity, parseSentence as parseSentenceCD } from './cdValidationParser.js'
 
 
 const QLI_PO_VARIANTS = "Po Number"
+const QLI_SERIAL_VARIANTS = ['Serial Number', 'serial_number', 'SERIAL_NUMBER']
 const QLI_SITE_VARIANTS = "Site Id"
 const QLI_PRODUCT_CODE_VARIANTS = "Item Code"
 const QLI_CHARGE_DESC_VARIANTS = "Item Description"
 const QLI_CHANGE_DESC_VARIANTS = "Changed Item Description"
 const QLI_QTY_VARIANTS = "Quantity"
-const QLI_UNIT_PRICE_VARIANTS = ['OTC', 'MRC']
+const QLI_UNIT_PRICE_VARIANTS = ['OTC', 'MRC','NRC','UP']
+const QLI_TOTAL_FALLBACK_COLS = ['line_item_total_amount', 'line_item_total_mrc', 'line_item_total_otc_nrc_value']
 const QLI_CURRENCY_VARIANTS = ['Currency', 'currency', 'CURR']
 
 /** Get expected result from base row (invoice). Reads "Expected Match" column (Y→P, N→F) and displays as P/F in UI. */
@@ -61,12 +63,6 @@ function getNumeric(row, key) {
   if (val == null || val === '') return NaN
   const cleaned = String(val).replace(/[$,]/g, '')
   return parseFloat(cleaned)
-}
-
-function parseDate(s) {
-  if (!s) return null
-  const d = new Date(s)
-  return isNaN(d.getTime()) ? null : d
 }
 
 function normalizeText(text) {
@@ -150,13 +146,22 @@ function getDescMatchScore(iliDesc, qliChargeDesc, qliChangeDesc) {
  * If (invoice_date >= invoice_start_date + initial_term) AND (invoice_date < invoice_start_date + initial_term + term): CUP = Unit Price * (1+initialTermIncrement)
  * If invoice_date >= invoice_start_date + initial_term + term: CUP = Unit Price * (1+initialTermIncrement) * (1+Increment)^num_completed_terms
  */
+/** QLI column name variants for line-level service start date (used for CUP). */
+const QLI_SERVICE_START_VARIANTS = ['line_item_service_start_date', 'Line Item Service Start Date', 'line item service start date']
+
 function getCUP(quoteItem, ili) {
-  const unitPrice = getNumeric(quoteItem, QLI_UNIT_PRICE_VARIANTS)
-  if (!(unitPrice > 0)) return NaN
+  const rawUnitPrice = getNumeric(quoteItem, QLI_UNIT_PRICE_VARIANTS)
+  if (rawUnitPrice === 0 || isNaN(rawUnitPrice)) return NaN
+  const unitPrice = Math.abs(rawUnitPrice)
 
   const invoiceDate = parseDate(getValue(ili, "RECURRING_CHARGE_TO_DATE"))
-  const serviceStart = parseDate(getValue(ili, "SERVICE_START_DATE"))
-  if (!serviceStart || !invoiceDate) return Math.round(unitPrice * 100) / 100
+  const qliServiceStartVal = getValue(quoteItem, QLI_SERVICE_START_VARIANTS)
+  const serviceStart = parseDate(qliServiceStartVal) || parseDate(getValue(ili, "SERVICE_START_DATE"))
+  if (!serviceStart || !invoiceDate) {
+    const cupMagnitude = Math.round(unitPrice * 100) / 100
+    const qliQty = getQLIQuantity(quoteItem)
+    return qliQty < 0 ? -cupMagnitude : cupMagnitude
+  }
 
   const initialTermMonthsRaw = getNumeric(ili, "FIRST_PRICE_INC_APP_AFTER")
   const renewalTermMonthsRaw = getNumeric(ili, "RENEWAL_TERM")
@@ -186,7 +191,10 @@ function getCUP(quoteItem, ili) {
       }
     }
   }
-  return result > 0 ? Math.round(result * 100) / 100 : NaN
+  const cupMagnitude = result > 0 ? Math.round(result * 100) / 100 : NaN
+  if (isNaN(cupMagnitude)) return NaN
+  const qliQty = getQLIQuantity(quoteItem)
+  return qliQty < 0 ? -cupMagnitude : cupMagnitude
 }
 
 function getCompletedTerms(invoiceDate, endInitial, termMonths) {
@@ -255,9 +263,67 @@ export function getQLIQuantity(qli) {
 }
 
 /**
- * Index quote data by PO for fast lookup.
- * Excludes QLI rows where both MRC and OTC are empty (such rows are not used for validation).
+ * Fallback QLI unit price: if standard price columns (OTC/MRC/NRC/UP) are missing,
+ * derive unit price from total amount columns divided by quantity.
+ * Tries columns in order: line_item_total_amount → line_item_total_mrc → line_item_total_otc_nrc_value.
+ * Returns { price, source } or { price: NaN, source: null } if not derivable.
  */
+function getQLIUnitPriceFromTotal(qli) {
+  const qty = getQLIQuantity(qli)
+  if (isNaN(qty) || qty === 0) return { price: NaN, source: null }
+  for (const col of QLI_TOTAL_FALLBACK_COLS) {
+    const total = getNumeric(qli, col)
+    if (!isNaN(total) && total !== 0) {
+      return { price: total / qty, source: col }
+    }
+  }
+  return { price: NaN, source: null }
+}
+
+/** Get serial from QLI row (tries known variants, then any key matching /serial/i). */
+function getQLISerial(row) {
+  if (!row || typeof row !== 'object') return ''
+  const byVariants = getValue(row, QLI_SERIAL_VARIANTS)
+  if (byVariants) return byVariants
+  for (const key of Object.keys(row)) {
+    if (/serial/i.test(String(key).replace(/[\s_-]/g, ''))) {
+      const v = row[key]
+      if (v != null && v !== '') return String(v).trim()
+    }
+  }
+  return ''
+}
+
+/**
+ * Index quote data by Serial Number for fast lookup (used by runValidation).
+ * Includes every QLI row that has a serial (no MRC/OTC filter at index time).
+ * Previously we skipped rows with both MRC and OTC ≤ 0, which dropped ~3k QLI rows
+ * and caused ~10k+ ILI lines to show "No QLI for Serial" even when the serial existed
+ * on the quote with no positive MRC/OTC. Price/CUP validation still runs later and
+ * can fail there if the matched QLI has no valid unit price.
+ */
+export function indexQuotesBySerialNumber(quoteData) {
+  const bySerial = {}
+  for (const row of quoteData || []) {
+    const serial = getQLISerial(row)
+    if (!serial || String(serial).trim() === '') continue
+    const key = String(serial).trim().toUpperCase()
+    if (!bySerial[key]) bySerial[key] = []
+    bySerial[key].push(row)
+  }
+  return bySerial
+}
+
+/** @deprecated Use indexQuotesBySerialNumber for validation. Index by PO for legacy scripts. */
+/** One-line + detail for UI/export when quote validation did not complete (skipped at a stage). */
+function setQuoteSkipReason(baseResult, validationStep, remarks) {
+  const step = validationStep != null ? String(validationStep).trim() : ''
+  const rem = remarks != null ? String(remarks).trim() : ''
+  if (!step && !rem) return
+  baseResult.quote_skip_stage = step || 'Quote - No match'
+  baseResult.quote_skip_reason = rem ? `${step || 'Quote skipped'}\n${rem}` : step
+}
+
 export function indexQuotesByPO(quoteData) {
   const byPO = {}
   for (const row of quoteData || []) {
@@ -265,13 +331,10 @@ export function indexQuotesByPO(quoteData) {
     if (!po) continue
     const otc = getNumeric(row, 'OTC')
     const mrc = getNumeric(row, 'MRC')
-    // Exclude rows that have no usable quote unit price:
-    // - both MRC and OTC missing, OR
-    // - both MRC and OTC are 0 (or <= 0)
     const hasOtc = !isNaN(otc) && otc > 0
     const hasMrc = !isNaN(mrc) && mrc > 0
     if (!hasOtc && !hasMrc) continue
-    const key = po.toUpperCase()
+    const key = String(po).trim().toUpperCase()
     if (!byPO[key]) byPO[key] = []
     byPO[key].push(row)
   }
@@ -279,12 +342,10 @@ export function indexQuotesByPO(quoteData) {
 }
 
 /**
- * Single ILI validation against a list of QLIs (already filtered by PO; PO filter is never skipped in caller).
- * IBX filter is mandatory and never skipped: ILI must have IBX and QLIs must match site_id.
- * Flow: 1) Filter by IBX/site_id (required) → if ILI has no IBX or no matching QLIs, rate card. 2) Item code or description: prefer item-code match; if found, use that QLI for unit price validation; else use best description match. 3) Unit price (and LLA, quantity) validation.
+ * Single ILI validation against a list of QLIs (already filtered by Serial number in caller).
+ * IBX filter applied (currency filter commented out); then description match only (no item code). Unit price/LLA/qty validation.
  * Returns { result, remarks, matchedQLI, validationStep }.
  * result: 'validated' | 'failed' | null (send to rate card validation)
- * validationStep: which step passed/failed (e.g. 'Quote - Passed', 'Quote - Failed (Unit price)').
  */
 export function validateILIAgainstQLIs(ili, qlis, options) {
   const {
@@ -294,7 +355,6 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
   } = options || {}
 
   const ibx = getValue(ili, "IBX") || ''
-  const itemCode = getValue(ili, "PRODUCT_CODE") || ''
   const chargeDesc = getValue(ili, "DESCRIPTION") || ''
   let quantity = getNumeric(ili, "QUANTITY")
   let unitPrice = getNumeric(ili, "UNIT_SELLING_PRICE")
@@ -317,7 +377,14 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
     llaCalculated = true
   }
 
-  // --- IBX filter (mandatory, never skipped): ILI must have IBX; QLI site_id must match ILI IBX ---
+  // Keep unit price and LLA same sign as quantity (ILI) before validation
+  if (quantity !== 0 && !isNaN(quantity)) {
+    const qtyPositive = quantity > 0
+    if (!isNaN(unitPrice) && unitPrice !== 0 && (unitPrice > 0) !== qtyPositive) unitPrice = -unitPrice
+    if (!isNaN(lla) && lla !== 0 && (lla > 0) !== qtyPositive) lla = -lla
+  }
+
+  // --- IBX filter (mandatory): ILI must have IBX; QLI site_id must match ILI IBX ---
   const ibxTrimmed = ibx != null ? String(ibx).trim() : ''
   if (!ibxTrimmed) {
     return { result: null, remarks: 'ILI has no IBX; cannot match quote by site.', matchedQLI: null, validationStep: 'Quote - No match (No IBX on ILI)' }
@@ -327,123 +394,188 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
     const qliSite = getQLISiteId(qli)
     const siteTrimmed = qliSite != null ? String(qliSite).trim() : ''
     if (!siteTrimmed) return false
-    return siteTrimmed.toUpperCase().includes(ibxTrimmed.toUpperCase())||ibxTrimmed.toUpperCase().includes(siteTrimmed.toUpperCase())
+    return siteTrimmed.toUpperCase().includes(ibxTrimmed.toUpperCase()) || ibxTrimmed.toUpperCase().includes(siteTrimmed.toUpperCase())
   })
 
   if (qlisByIbx.length === 0) {
-    return { result: null, remarks: 'No QLI with matching site_id/IBX for this PO.', matchedQLI: null, validationStep: 'Quote - No match (No IBX/site_id)' }
+    return { result: null, remarks: 'No QLI with matching site_id/IBX for this serial.', matchedQLI: null, validationStep: 'Quote - No match (No IBX/site_id)' }
   }
 
-  // --- Currency filter (before charge description): only QLIs whose currency matches ILI CURR ---
-  const iliCurr = getValue(ili, ['CURR', 'curr', 'currency'])
-  const iliCurrNorm = iliCurr != null ? String(iliCurr).trim().toUpperCase() : ''
+  // --- Currency filter (COMMENTED OUT for now): only QLIs whose currency matches ILI CURR ---
+  // const iliCurr = getValue(ili, ['CURR', 'curr', 'currency'])
+  // const iliCurrNorm = iliCurr != null ? String(iliCurr).trim().toUpperCase() : ''
+  // let qlisForMatch = qlisByIbx
+  // if (iliCurrNorm) {
+  //   qlisForMatch = qlisByIbx.filter(qli => {
+  //     const qliCurr = getValue(qli, QLI_CURRENCY_VARIANTS)
+  //     const qliCurrNorm = qliCurr != null ? String(qliCurr).trim().toUpperCase() : ''
+  //     return qliCurrNorm === iliCurrNorm
+  //   })
+  // }
+  // if (qlisForMatch.length === 0) {
+  //   return { result: null, remarks: 'No QLI with matching currency (CURR) for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Currency)' }
+  // }
+
+  // With currency filter off: use QLIs that passed IBX for further matching
   let qlisForMatch = qlisByIbx
-  if (iliCurrNorm) {
-    qlisForMatch = qlisByIbx.filter(qli => {
-      const qliCurr = getValue(qli, QLI_CURRENCY_VARIANTS)
-      const qliCurrNorm = qliCurr != null ? String(qliCurr).trim().toUpperCase() : ''
-      return qliCurrNorm === iliCurrNorm
+
+  // Quantity sign filter: if ILI quantity is negative, only validate against QLIs with negative quantity.
+  // (Requested: negative ILI → negative QLI)
+  if (quantity < 0) {
+    qlisForMatch = qlisForMatch.filter(qli => {
+      const q = getQLIQuantity(qli)
+      return !isNaN(q) && q < 0
     })
-  }
-  if (qlisForMatch.length === 0) {
-    return { result: null, remarks: 'No QLI with matching currency (CURR) for this PO/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Currency)' }
+    if (qlisForMatch.length === 0) {
+      return { result: null, remarks: 'ILI quantity is negative; no QLI with negative quantity for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Quantity sign)' }
+    }
   }
 
-  // --- Item code match: collect QLIs that match by item code (with description match count for tie-break) ---
-  const itemCodeMatches = []
-  for (const qli of qlisForMatch) {
-    const qliProductCode = getQLIProductCode(qli)
-    if (!itemCode || !qliProductCode) continue
-    const ni = normalizeText(itemCode)
-    const nq = normalizeText(qliProductCode)
-    if (ni.includes(nq) || nq.includes(ni)) {
-      const descScore = getDescMatchScore(chargeDesc, getQLIChargeDesc(qli), getQLIChangeDesc(qli))
-      itemCodeMatches.push({ qli, matchCount: descScore.matchCount })
+  // --- Item code + description matching ---
+  const iliItemCodeRaw = getValue(ili, "PRODUCT_CODE") || ''
+  const iliItemCodeNorm = normalizeText(iliItemCodeRaw)
+
+  // 3a. Item-code match (ILI has item code): require BOTH item-code match AND description ≥ 60%
+  if (iliItemCodeNorm) {
+    const itemCodeCandidates = []
+    for (const qli of qlisForMatch) {
+      const qliCodeRaw = getQLIProductCode(qli)
+      const qliCodeNorm = normalizeText(qliCodeRaw)
+      if (!qliCodeNorm) continue
+      if (!qliCodeNorm.includes(iliItemCodeNorm) && !iliItemCodeNorm.includes(qliCodeNorm)) continue
+      const qliChargeDesc = getQLIChargeDesc(qli)
+      const qliChangeDesc = getQLIChangeDesc(qli)
+      let descScore = getDescMatchScore(chargeDesc, qliChargeDesc, qliChangeDesc)
+      if (!descScore.passes && chargeDesc && !qliChargeDesc && !qliChangeDesc) {
+        const possibleDescs = getPossibleDescValuesFromRow(qli)
+        let bestFallback = { passes: false, matchCount: 0 }
+        for (const candidate of possibleDescs) {
+          const s = getDescMatchScore(chargeDesc, candidate, '')
+          if (s.passes && s.matchCount > bestFallback.matchCount) bestFallback = s
+        }
+        if (bestFallback.passes) descScore = bestFallback
+      }
+      // Strict: only include if description match is ≥ 60%
+      if (!descScore.passes) continue
+      itemCodeCandidates.push({ qli, matchCount: descScore.matchCount != null ? descScore.matchCount : 0 })
     }
+    if (itemCodeCandidates.length > 0) {
+      let best = itemCodeCandidates[0]
+      for (let i = 1; i < itemCodeCandidates.length; i++) {
+        if (itemCodeCandidates[i].matchCount > best.matchCount) best = itemCodeCandidates[i]
+      }
+      return validateWithQLI(best.qli)
+    }
+    return { result: null, remarks: 'No QLI matched by item code with description ≥ 60% for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Item code/description)' }
+  }
+
+  // 3b. ILI has no item code – description-only, but only against QLIs that also have empty item code
+  qlisForMatch = qlisForMatch.filter(qli => {
+    const qliCodeNorm = normalizeText(getQLIProductCode(qli))
+    return !qliCodeNorm
+  })
+  if (qlisForMatch.length === 0) {
+    return { result: null, remarks: 'ILI has no item code and no QLI with empty item code for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Item code/description)' }
+  }
+
+  // --- Description match (no item code, or both sides empty item code): pick best QLI by CD similarity > 60% ---
+  const descCandidates = []
+  for (const qli of qlisForMatch) {
+    const qliChargeDesc = getQLIChargeDesc(qli)
+    const qliChangeDesc = getQLIChangeDesc(qli)
+    let descScore = getDescMatchScore(chargeDesc, qliChargeDesc, qliChangeDesc)
+    if (!descScore.passes && chargeDesc && !qliChargeDesc && !qliChangeDesc) {
+      const possibleDescs = getPossibleDescValuesFromRow(qli)
+      let bestFallback = { passes: false, matchCount: 0 }
+      for (const candidate of possibleDescs) {
+        const s = getDescMatchScore(chargeDesc, candidate, '')
+        if (s.passes && s.matchCount > bestFallback.matchCount) bestFallback = s
+      }
+      if (bestFallback.passes) descScore = bestFallback
+    }
+    if (!descScore.passes) continue
+    descCandidates.push({ qli, matchCount: descScore.matchCount })
+  }
+
+  let selectedQLI = null
+  if (descCandidates.length > 0) {
+    let best = descCandidates[0]
+    for (let i = 1; i < descCandidates.length; i++) {
+      if (descCandidates[i].matchCount > best.matchCount) best = descCandidates[i]
+    }
+    selectedQLI = best.qli
+  }
+
+  if (!selectedQLI) {
+    return { result: null, remarks: 'No QLI matched by description (CD similarity > 60% required).', matchedQLI: null, validationStep: 'Quote - No match (Description)' }
   }
 
   // Run price/LLA/quantity validation for one QLI; returns result object.
   function validateWithQLI(qli) {
     if (unitPrice === 0 && lla === 0 ||unitPrice==''&& lla==''||isNaN(unitPrice)&&isNaN(lla)) {
-      return { result: 'validated', remarks: 'Unit Price and LLA are zero; no charge.', matchedQLI: qli, validationStep: 'Quote - Passed (No charge)', effectiveLla: 0, llaCalculated, ella: NaN }
+      return { result: 'validated', remarks: 'Unit Price and LLA are zero; no charge.', matchedQLI: qli, validationStep: 'Quote - Passed (No charge)', effectiveLla: 0, llaCalculated, ella: NaN, cup: NaN, fallbackUnitPrice: NaN, fallbackUnitPriceSource: null }
     }
     const cup = getCUP(qli, ili)
-    const cup_within_tolerance_raw = cup * (1 + priceTolerance)
-    const cup_within_tolerance = Math.round(cup_within_tolerance_raw * 100) / 100
-    if (isNaN(cup) || cup <= 0) {
-      return { result: 'failed', remarks: 'No valid quote unit price (CUP) for date.', matchedQLI: qli, validationStep: 'Quote - Failed (No CUP)', effectiveLla: lla, llaCalculated, ella: NaN }
+
+    // Fallback: if no unit price from standard columns (OTC/MRC/NRC/UP), derive from total / quantity
+    let effectiveCup = cup
+    let fallbackUnitPrice = NaN
+    let fallbackUnitPriceSource = null
+    if (isNaN(cup) || cup === 0) {
+      const fallback = getQLIUnitPriceFromTotal(qli)
+      if (!isNaN(fallback.price) && fallback.price !== 0) {
+        effectiveCup = fallback.price
+        fallbackUnitPrice = fallback.price
+        fallbackUnitPriceSource = fallback.source
+      }
     }
+
+    const cup_within_tolerance_raw = effectiveCup * (1 + priceTolerance)
+    const cup_within_tolerance = Math.round(cup_within_tolerance_raw * 100) / 100
+    if (isNaN(effectiveCup) || effectiveCup === 0) {
+      return { result: 'failed', remarks: 'No valid quote unit price (CUP) for date.', matchedQLI: qli, validationStep: 'Quote - Failed (No CUP)', effectiveLla: lla, llaCalculated, ella: NaN, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
+    }
+
+    const fallbackNote = fallbackUnitPriceSource ? ` (QLI unit price derived from ${fallbackUnitPriceSource} / Quantity)` : ''
+
     const pf = getPF(ili)
     // Before comparing: if PF < 1, normalize unit price and LLA so that PF * (1/PF) = 1 (full-period equivalent)
     const normFactor = pf > 0 && pf < 1 ? 1 / pf : 1
     const unitPriceForCompare = normFactor === 1 ? unitPrice : (isNaN(unitPrice) ? unitPrice : unitPrice * normFactor)
     const llaForCompare = normFactor === 1 ? lla : (isNaN(lla) ? lla : lla * normFactor)
-    if (unitPriceForCompare > cup_within_tolerance) {
-      const ella = cup * quantity * pf
-      return { result: 'failed', remarks: `Unit price ${unitPrice.toFixed(2)} exceeds CUP*(1+tolerance)=${cup_within_tolerance}`, matchedQLI: qli, validationStep: 'Quote - Failed (Unit price)', effectiveLla: lla, llaCalculated, ella }
+    const unitPriceExceedsTolerance = effectiveCup > 0
+      ? unitPriceForCompare > cup_within_tolerance
+      : unitPriceForCompare > cup_within_tolerance
+    if (unitPriceExceedsTolerance) {
+      const ella = effectiveCup * quantity * pf
+      const upDisplay = !isNaN(unitPrice) ? unitPrice.toFixed(2) : 'N/A'
+      return { result: 'failed', remarks: `Unit price ${upDisplay} exceeds CUP*(1+tolerance)=${cup_within_tolerance}${fallbackNote}`, matchedQLI: qli, validationStep: 'Quote - Failed (Unit price)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
     }
     const qtyILI = quantity
-    const ella = cup * qtyILI * pf
-    if (!isNaN(llaForCompare) && llaForCompare > ella * (1 + priceTolerance)) {
-      return { result: 'failed', remarks: `LLA ${lla.toFixed(2)} exceeds ELLA*(1+tolerance)=${(ella * (1 + priceTolerance)).toFixed(2)}`, matchedQLI: qli, validationStep: 'Quote - Failed (LLA)', effectiveLla: lla, llaCalculated, ella }
+    if (qtyILI<0){
+      var priceTolerance=-1*priceTolerance;
+    }
+    // Signed comparison only: ELLA same sign as CUP (and qty). For negative qty we compare -15 vs -14.58, never |15| vs |14.58|.
+    const ella = effectiveCup * Math.abs(qtyILI) * pf
+    const ellaTol = ella * (1 + priceTolerance)
+    const llaExceedsElla = qtyILI > 0
+      ? llaForCompare > ellaTol
+      : llaForCompare > ellaTol
+    if (!isNaN(llaForCompare) && llaExceedsElla) {
+      const msg = qtyILI < 0
+        ? `LLA ${lla.toFixed(2)} is more negative than allowed ELLA*(1+tolerance)=${(ellaTol).toFixed(2)}${fallbackNote}`
+        : `LLA ${lla.toFixed(2)} exceeds ELLA*(1+tolerance)=${(ellaTol).toFixed(2)}${fallbackNote}`
+      return { result: 'failed', remarks: msg, matchedQLI: qli, validationStep: 'Quote - Failed (LLA)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
     }
     const qliQty = getQLIQuantity(qli)
-    if (isNaN(qliQty) || qliQty <= 0) {
-      return { result: 'failed', remarks: 'No quote quantity on matched QLI.', matchedQLI: qli, validationStep: 'Quote - Failed (No quote quantity)', effectiveLla: lla, llaCalculated, ella }
+    if (isNaN(qliQty) || qliQty === 0) {
+      return { result: 'validated', remarks: `No quote quantity on matched QLI.${fallbackNote}`, matchedQLI: qli, validationStep: 'Quote - Passed (No quote quantity)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
     }
-    if (qtyILI > qliQty * (1 + qtyTolerance)) {
-      return { result: 'failed', remarks: `Quantity ${qtyILI} exceeds quote quantity ${qliQty} * (1+${(qtyTolerance * 100).toFixed(0)}%)`, matchedQLI: qli, validationStep: 'Quote - Failed (Quantity)', effectiveLla: lla, llaCalculated, ella }
+    const qtyExceedsQuote = Math.abs(qtyILI) > Math.abs(qliQty) * (1 + qtyTolerance)
+    if (qtyExceedsQuote) {
+      return { result: 'validated', remarks: `All validations passed (Quantity mismatch: ILI qty ${qtyILI} exceeds QLI qty ${qliQty} * (1+${(qtyTolerance * 100).toFixed(0)}%))${fallbackNote}`, matchedQLI: qli, validationStep: 'Quote - Passed (Qty mismatch)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
     }
-    return { result: 'validated', remarks: 'All validations passed.', matchedQLI: qli, validationStep: 'Quote - Passed', effectiveLla: lla, llaCalculated, ella }
-  }
-
-  let selectedQLI = null
-  if (itemCodeMatches.length > 0) {
-    // Use item-code match: take the one with best description match count for tie-break
-    let best = itemCodeMatches[0]
-    for (let i = 1; i < itemCodeMatches.length; i++) {
-      if (itemCodeMatches[i].matchCount > best.matchCount) best = itemCodeMatches[i]
-    }
-    // In quotation validation desc match must be > 60% else ILI goes to rate card validation
-    if (best.matchCount > 60) {
-      selectedQLI = best.qli
-    }
-  } else {
-    // No item-code match: use filtered list by PO, IBX and currency (qlisForMatch). If ILI has no item code, do charge description matching only with QLI rows that have empty item code.
-    if (!itemCode || String(itemCode).trim() === '') {
-      const qlisWithEmptyItemCode = qlisForMatch.filter(qli => {
-        const qc = getQLIProductCode(qli)
-        return !qc || String(qc).trim() === ''
-      })
-      const descCandidates = []
-      for (const qli of qlisWithEmptyItemCode) {
-        const qliChargeDesc = getQLIChargeDesc(qli)
-        const qliChangeDesc = getQLIChangeDesc(qli)
-        let descScore = getDescMatchScore(chargeDesc, qliChargeDesc, qliChangeDesc)
-        if (!descScore.passes && chargeDesc && !qliChargeDesc && !qliChangeDesc) {
-          const possibleDescs = getPossibleDescValuesFromRow(qli)
-          let bestFallback = { passes: false, matchCount: 0 }
-          for (const candidate of possibleDescs) {
-            const s = getDescMatchScore(chargeDesc, candidate, '')
-            if (s.passes && s.matchCount > bestFallback.matchCount) bestFallback = s
-          }
-          if (bestFallback.passes) descScore = bestFallback
-        }
-        if (!descScore.passes) continue
-        descCandidates.push({ qli, matchCount: descScore.matchCount })
-      }
-      if (descCandidates.length > 0) {
-        let best = descCandidates[0]
-        for (let i = 1; i < descCandidates.length; i++) {
-          if (descCandidates[i].matchCount > best.matchCount) best = descCandidates[i]
-        }
-        selectedQLI = best.qli
-      }
-    }
-  }
-
-  if (!selectedQLI) {
-    return { result: null, remarks: 'No QLI matched by item code or description (when ILI has no item code, only QLIs with empty item code are considered).', matchedQLI: null, validationStep: 'Quote - No match (Item code/description)' }
+    return { result: 'validated', remarks: `All validations passed.${fallbackNote}`, matchedQLI: qli, validationStep: 'Quote - Passed', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
   }
 
   const qli = selectedQLI
@@ -452,17 +584,17 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
 
 /**
  * Full validation flow for each ILI:
- * PO and IBX filters are mandatory and must never be skipped.
- * 1) PO filter: ILI must have a PO; filter QLIs by PO number (match ILI PO). If ILI has no PO or no QLIs → For Rate Card Validation.
- * 2) IBX filter: ILI must have an IBX; filter those QLIs by IBX/site_id (ILI IBX must match QLI site_id). If ILI has no IBX or no matching QLIs → For Rate Card Validation.
- * 3) Item code or description: prefer item-code match; if a QLI matches by item code, use it for unit price validation; else use best description match (min n-1 words). If no match → For Rate Card Validation.
- * 4) Unit price (and LLA, quantity) validation on the selected QLI.
+ * 1) Serial number filter: ILI must have a Serial number; index QLIs by Serial (QLI Serial = ILI Serial). If ILI has no Serial or no QLIs for that Serial → For Rate Card Validation.
+ * 2) IBX filter: ILI must have IBX; QLI Site Id must match ILI IBX. If no match → For Rate Card Validation.
+ * 3) Currency filter: (COMMENTED OUT) formerly only QLIs whose currency matches ILI CURR.
+ * 4) Description match only (no item code): pick best QLI by CD similarity > 60%. If no match → For Rate Card Validation.
+ * 5) Unit price (and LLA, quantity) validation on the selected QLI.
  * If result is "For Rate Card Validation" and rateCardData + rateCardConfig provided, run rate card validation.
  * Returns array of { row, serial_number, line_number, trx_number, po_number, ibx, validation_result, remarks, ... }
  */
 export function runValidation(baseData, quoteData, options = {}) {
   const results = []
-  const byPO = indexQuotesByPO(quoteData)
+  const bySerial = indexQuotesBySerialNumber(quoteData)
   let passedCount = 0
   let failedCount = 0
   let rateCardCount = 0
@@ -471,9 +603,8 @@ export function runValidation(baseData, quoteData, options = {}) {
     const ili = baseData[i]
     const rowNumber = i + 1
     const po = getValue(ili, "PO_NUMBER")
-    const poTrimmed = po != null ? String(po).trim() : ''
-
     const serialNumber = getValue(ili, ['SERIAL_NUMBER', 'serial_number'])
+    const serialTrimmed = serialNumber != null ? String(serialNumber).trim() : ''
     const lineNumber = getValue(ili, ['LINE_NUMBER', 'line_number'])
     const trxNumber = getValue(ili, ['invoice_number', 'TRX_NUMBER', 'trx_number', 'Invoice Number'])
 
@@ -523,30 +654,32 @@ export function runValidation(baseData, quoteData, options = {}) {
       baseResult.lla_calculated = false
     }
 
-    // PO filter (mandatory, never skipped): ILI must have a PO to attempt quote validation
-    if (!poTrimmed) {
+    // Serial number filter (mandatory): ILI must have a serial number to attempt quote validation
+    if (!serialTrimmed) {
       baseResult.validation_result = 'Skipped'
-      baseResult.validation_step = 'Quote - No match (No PO on ILI)'
-      baseResult.remarks = 'ILI has no PO number; cannot match quote by PO.'
+      baseResult.validation_step = 'Quote - No match (No Serial on ILI)'
+      baseResult.remarks = 'ILI has no Serial number; cannot match quote by Serial.'
+      setQuoteSkipReason(baseResult, baseResult.validation_step, baseResult.remarks)
       rateCardCount++
       results.push(baseResult)
       continue
     }
 
-    const key = poTrimmed.toUpperCase()
-    const qlis = byPO[key] || []
+    const key = serialTrimmed.toUpperCase()
+    const qlis = bySerial[key] || []
 
-    // PO filter (mandatory): no QLIs with this PO → rate card
+    // Serial filter: no QLIs for this serial → rate card
     if (qlis.length === 0) {
       baseResult.validation_result = 'Skipped'
-      baseResult.validation_step = 'Quote - No match (No PO)'
-      baseResult.remarks = 'No matching quote line items for this PO number.'
+      baseResult.validation_step = 'Quote - No match (No QLI for Serial)'
+      baseResult.remarks = 'No matching quote line items for this Serial number.'
+      setQuoteSkipReason(baseResult, baseResult.validation_step, baseResult.remarks)
       rateCardCount++
       results.push(baseResult)
       continue
     }
 
-    const { result, remarks, matchedQLI, validationStep, effectiveLla, llaCalculated, ella } = validateILIAgainstQLIs(ili, qlis, options)
+    const { result, remarks, matchedQLI, validationStep, effectiveLla, llaCalculated, ella, cup, fallbackUnitPrice, fallbackUnitPriceSource } = validateILIAgainstQLIs(ili, qlis, options)
     baseResult.remarks = remarks
     baseResult.validation_step = validationStep || ''
     if (effectiveLla !== undefined) {
@@ -554,20 +687,30 @@ export function runValidation(baseData, quoteData, options = {}) {
       baseResult.lla_calculated = llaCalculated === true
     }
     if (ella !== undefined && !isNaN(ella)) baseResult.ella = ella
+    if (cup !== undefined && !isNaN(cup)) baseResult.qli_cup = cup
     if (matchedQLI) {
       baseResult.qli_number = getValue(matchedQLI, ['Number', 'QLI_NUMBER', 'Line Number', 'line_number'])
+      baseResult.qli_serial_number = getQLISerial(matchedQLI)
       baseResult.qli_po_number = getValue(matchedQLI, "Po Number")
       baseResult.qli_currency = getValue(matchedQLI, QLI_CURRENCY_VARIANTS)
       baseResult.qli_site_id = getQLISiteId(matchedQLI)
       baseResult.qli_item_code = getQLIProductCode(matchedQLI)
       baseResult.qli_quantity = getQLIQuantity(matchedQLI)
-      baseResult.qli_unit_price = getNumeric(matchedQLI, QLI_UNIT_PRICE_VARIANTS)
+      // Use fallback-derived unit price for display when standard columns had no price
+      const standardUnitPrice = getNumeric(matchedQLI, QLI_UNIT_PRICE_VARIANTS)
+      baseResult.qli_unit_price = (!isNaN(standardUnitPrice) && standardUnitPrice !== 0)
+        ? standardUnitPrice
+        : (!isNaN(fallbackUnitPrice) ? fallbackUnitPrice : standardUnitPrice)
+      if (!isNaN(fallbackUnitPrice) && fallbackUnitPriceSource) {
+        baseResult.qli_unit_price_source = `Derived from ${fallbackUnitPriceSource} / Quantity`
+      }
       baseResult.qli_description = getQLIChargeDesc(matchedQLI)
       const qliDescForTokens = baseResult.qli_description || ''
       baseResult.qli_desc_tokens = formatCDTokensForDisplay(parseSentenceCD(qliDescForTokens))
       const descScore = getDescMatchScore(baseResult.ili_description, getQLIChargeDesc(matchedQLI), getQLIChangeDesc(matchedQLI))
       baseResult.desc_match_percentage = descScore.matchCount !== undefined && descScore.matchCount !== '' ? descScore.matchCount : ''
       baseResult.qli_invoice_start_date = formatDateForDisplay(getValue(matchedQLI, "Invoice start date"))
+      baseResult.qli_line_item_service_start_date = formatDateForDisplay(getValue(matchedQLI, QLI_SERVICE_START_VARIANTS))
       baseResult.qli_renewal_term = getValue(matchedQLI, "renewal term")
       baseResult.qli_first_Price_increment_applicable_after = getValue(matchedQLI, "first_Price_increment_applicable_after")
       baseResult.qli_price_increase_percentage = getValue(matchedQLI, "price_increase_percentage")
@@ -583,6 +726,7 @@ export function runValidation(baseData, quoteData, options = {}) {
       baseResult.validation_result = 'Skipped'
       baseResult.validation_step = baseResult.validation_step || 'Quote - No match'
       baseResult.remarks = baseResult.remarks || 'No QLI matched (IBX/product/charge/price/quantity).'
+      setQuoteSkipReason(baseResult, baseResult.validation_step, baseResult.remarks)
       rateCardCount++
     }
     results.push(baseResult)
@@ -598,7 +742,14 @@ export function runValidation(baseData, quoteData, options = {}) {
       const rcResult = validateWithRateCard(ili, rateCardData, rateCardConfig, {
         priceTolerance: options.priceTolerance != null ? options.priceTolerance : 0.05
       })
-      results[i].remarks = rcResult.remarks
+      // Preserve quote-skip remarks (why quote validation was skipped); append rate card outcome
+      const quoteSkipRemarks = (results[i].remarks || '').trim()
+      const rcRemarks = (rcResult.remarks || '').trim()
+      if (quoteSkipRemarks && rcRemarks) {
+        results[i].remarks = `${quoteSkipRemarks}\n— Rate card: ${rcRemarks}`
+      } else {
+        results[i].remarks = rcRemarks || quoteSkipRemarks
+      }
       if (rcResult.result === 'validated') {
         results[i].validation_result = 'Passed'
         results[i].validation_step = 'Rate Card - Passed'
@@ -611,6 +762,11 @@ export function runValidation(baseData, quoteData, options = {}) {
         failedCount++
       } else {
         results[i].validation_step = 'Rate Card - No match / Skipped'
+        const prevStage = results[i].quote_skip_stage || ''
+        const prevReason = results[i].quote_skip_reason || ''
+        if (prevStage || prevReason) {
+          results[i].quote_skip_reason = prevReason ? `${prevReason}\n— Then rate card: ${rcResult.remarks || 'No match'}` : `— Rate card: ${rcResult.remarks || 'No match'}`
+        }
       }
       if (rcResult.rc_u_rate_card_sub_type !== undefined) results[i].rc_u_rate_card_sub_type = rcResult.rc_u_rate_card_sub_type
       if (rcResult.rc_u_rate_card_type !== undefined) results[i].rc_u_rate_card_type = rcResult.rc_u_rate_card_type
@@ -637,6 +793,10 @@ export function runValidation(baseData, quoteData, options = {}) {
   for (let i = 0; i < results.length; i++) {
     if (results[i].validation_result === 'Skipped') {
       results[i].validation_result = 'Failed'
+      // Ensure quote skip stage/reason is set so UI still shows why quote was skipped
+      if (!results[i].quote_skip_reason && (results[i].validation_step || '').includes('Quote - No match')) {
+        setQuoteSkipReason(results[i], results[i].validation_step, results[i].remarks)
+      }
       failedCount++
     }
   }

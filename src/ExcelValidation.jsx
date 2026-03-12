@@ -4,6 +4,55 @@ import { runValidation as runValidationLogic } from './validationLogic'
 import { formatDateForDisplay } from './rateCardValidation.js'
 import './ExcelValidation.css'
 
+// ── IndexedDB cache helpers ──────────────────────────────────────────────────
+const IDB_NAME = 'equinix-file-cache'
+const IDB_STORE = 'parsed-files'
+
+function openCacheDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1)
+    req.onupgradeneeded = (e) => e.target.result.createObjectStore(IDB_STORE)
+    req.onsuccess = (e) => resolve(e.target.result)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function getCached(key) {
+  try {
+    const db = await openCacheDB()
+    return await new Promise((resolve) => {
+      const req = db.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).get(key)
+      req.onsuccess = () => resolve(req.result || null)
+      req.onerror = () => resolve(null)
+    })
+  } catch { return null }
+}
+
+async function setCached(key, value) {
+  try {
+    const db = await openCacheDB()
+    await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite')
+      tx.objectStore(IDB_STORE).put(value, key)
+      tx.oncomplete = resolve
+      tx.onerror = resolve
+    })
+  } catch { /* non-critical */ }
+}
+
+async function deleteCached(key) {
+  try {
+    const db = await openCacheDB()
+    await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite')
+      tx.objectStore(IDB_STORE).delete(key)
+      tx.oncomplete = resolve
+      tx.onerror = resolve
+    })
+  } catch { /* non-critical */ }
+}
+// ────────────────────────────────────────────────────────────────────────────
+
 // Outcome matches expected: P+Passed or F+Failed counts as pass
 function outcomeMatchedExpected(r) {
   const raw = String(r.expected_result ?? '').trim().toUpperCase()
@@ -23,7 +72,10 @@ function isRCValidation(row) {
 // Column order and labels for Excel export (all UI columns so download is complete and reviewable without lag)
 const EXPORT_COLUMNS = [
   ['row', 'Row'],
-  ['serial_number', 'Serial Number'],
+  ['quote_skip_stage', 'Quote skipped at (stage)'],
+  ['quote_skip_reason', 'Quote skip — stage & remarks'],
+  ['serial_number', 'ILI Serial Number'],
+  ['qli_serial_number', 'QLI Serial Number'],
   ['line_number', 'Line Number'],
   ['trx_number', 'TRX / Invoice Number'],
   ['ili_number', 'ILI Number'],
@@ -43,6 +95,7 @@ const EXPORT_COLUMNS = [
   ['qli_quantity', 'QLI Quantity'],
   ['unit_price', 'ILI Unit Price'],
   ['qli_unit_price', 'QLI Unit Price'],
+  ['qli_cup', 'QLI CUP (computed)'],
   ['effective_lla', 'LLA (effective)'],
   ['lla_calculated', 'LLA calculated'],
   ['ella', 'ELLA'],
@@ -53,6 +106,7 @@ const EXPORT_COLUMNS = [
   ['desc_match_percentage', 'Desc Match %'],
   ['ili_invoice_start_date', 'ILI Invoice Start Date'],
   ['qli_invoice_start_date', 'QLI Invoice Start Date'],
+  ['qli_line_item_service_start_date', 'QLI Line Item Service Start Date'],
   ['ili_renewal_term', 'ILI Renewal Term'],
   ['qli_renewal_term', 'QLI Renewal Term'],
   ['ili_first_Price_increment_applicable_after', 'ILI First Price Inc After'],
@@ -83,7 +137,7 @@ const EXPORT_COLUMNS = [
   ['remarks', 'Remarks']
 ]
 
-const DATE_EXPORT_KEYS = new Set(['ili_invoice_start_date', 'qli_invoice_start_date', 'ili_billing_from', 'ili_billing_till', 'rc_u_effective_from', 'rc_effective_till'])
+const DATE_EXPORT_KEYS = new Set(['ili_invoice_start_date', 'qli_invoice_start_date', 'qli_line_item_service_start_date', 'ili_billing_from', 'ili_billing_till', 'rc_u_effective_from', 'rc_effective_till'])
 
 function rowToExportRow(result) {
   const out = {}
@@ -92,6 +146,7 @@ function rowToExportRow(result) {
     if (v === undefined || v === null) v = ''
     else if (typeof v === 'number' && isNaN(v)) v = ''
     else if (key === 'lla_calculated') v = v ? 'Yes' : ''
+    else if (key === 'quote_skip_reason' && typeof v === 'string' && v.includes('\n')) v = v.replace(/\n+/g, ' | ')
     else if (DATE_EXPORT_KEYS.has(key) && v !== '') v = formatDateForDisplay(v) || v
     out[label] = v
   }
@@ -104,6 +159,16 @@ const ResultRow = memo(function ResultRow({ result }) {
   return (
     <tr className={`result-row ${(result.validation_result || '').toLowerCase().replace(/\s+/g, '-')}`}>
       <td>{result.row}</td>
+      <td className="quote-skip-stage-cell">{result.quote_skip_stage ?? '-'}</td>
+      <td className="quote-skip-reason-cell">
+        {result.quote_skip_reason ? (
+          <span className="quote-skip-reason-text">{result.quote_skip_reason}</span>
+        ) : (
+          '-'
+        )}
+      </td>
+      <td>{result.serial_number ?? '-'}</td>
+      <td>{result.qli_serial_number ?? '-'}</td>
       <td>{result.ili_number ?? '-'}</td>
       <td>{result.qli_number ?? '-'}</td>
       <td>{result.po_number ?? '-'}</td>
@@ -121,6 +186,7 @@ const ResultRow = memo(function ResultRow({ result }) {
       <td className="qty-cell">{fmtNum(result.qli_quantity)}</td>
       <td className="price-cell">{result.unit_price !== undefined && !isNaN(result.unit_price) ? `$${Number(result.unit_price).toFixed(2)}` : '-'}</td>
       <td className="price-cell">{result.qli_unit_price !== undefined && result.qli_unit_price !== '' && !isNaN(Number(result.qli_unit_price)) ? `$${Number(result.qli_unit_price).toFixed(2)}` : '-'}</td>
+      <td className="price-cell">{result.qli_cup !== undefined && result.qli_cup !== '' && !isNaN(Number(result.qli_cup)) ? `$${Number(result.qli_cup).toFixed(2)}` : '-'}</td>
       <td className="price-cell">{result.effective_lla !== undefined && !isNaN(result.effective_lla) ? `$${Number(result.effective_lla).toFixed(2)}` : '-'}</td>
       <td>{result.lla_calculated ? 'Yes' : '-'}</td>
       <td className="price-cell">{result.ella !== undefined && !isNaN(result.ella) ? `$${Number(result.ella).toFixed(2)}` : '-'}</td>
@@ -131,6 +197,7 @@ const ResultRow = memo(function ResultRow({ result }) {
       <td className="qty-cell">{result.desc_match_percentage !== undefined && result.desc_match_percentage !== '' ? `${result.desc_match_percentage}%` : '-'}</td>
       <td>{formatDateForDisplay(result.ili_invoice_start_date) || '-'}</td>
       <td>{formatDateForDisplay(result.qli_invoice_start_date) || '-'}</td>
+      <td>{formatDateForDisplay(result.qli_line_item_service_start_date) || '-'}</td>
       <td>{result.ili_renewal_term ?? '-'}</td>
       <td>{result.qli_renewal_term ?? '-'}</td>
       <td>{result.ili_first_Price_increment_applicable_after ?? '-'}</td>
@@ -246,6 +313,7 @@ function ValidationResults({ results }) {
       const search = debouncedSearch.toLowerCase()
       filtered = filtered.filter(r =>
         (r.serial_number || '').toString().toLowerCase().includes(search) ||
+        (r.qli_serial_number || '').toString().toLowerCase().includes(search) ||
         (r.line_number || '').toString().toLowerCase().includes(search) ||
         (r.trx_number || '').toString().toLowerCase().includes(search) ||
         (r.ili_number || '').toString().toLowerCase().includes(search) ||
@@ -263,6 +331,7 @@ function ValidationResults({ results }) {
         (r.qli_description || '').toString().toLowerCase().includes(search) ||
         (r.ili_invoice_start_date || '').toString().toLowerCase().includes(search) ||
         (r.qli_invoice_start_date || '').toString().toLowerCase().includes(search) ||
+        (r.qli_line_item_service_start_date || '').toString().toLowerCase().includes(search) ||
         (r.ili_renewal_term || '').toString().toLowerCase().includes(search) ||
         (r.qli_renewal_term || '').toString().toLowerCase().includes(search) ||
         (r.rc_u_rate_card_sub_type || '').toString().toLowerCase().includes(search) ||
@@ -274,6 +343,8 @@ function ValidationResults({ results }) {
         (r.rc_u_volt || '').toString().toLowerCase().includes(search) ||
         (r.remarks || '').toString().toLowerCase().includes(search) ||
         (r.validation_step || '').toString().toLowerCase().includes(search) ||
+        (r.quote_skip_stage || '').toString().toLowerCase().includes(search) ||
+        (r.quote_skip_reason || '').toString().toLowerCase().includes(search) ||
         (r.ili_billing_from || '').toString().toLowerCase().includes(search) ||
         (r.ili_billing_till || '').toString().toLowerCase().includes(search) ||
         (r.effective_lla != null ? String(r.effective_lla) : '').toLowerCase().includes(search) ||
@@ -471,6 +542,10 @@ function ValidationResults({ results }) {
             <thead>
               <tr>
                 <th>Row</th>
+                <th title="Which quote validation stage caused skip (e.g. Serial, IBX, Currency, Description)">Quote skipped at</th>
+                <th title="Stage + remarks why quote validation did not complete">Quote skip remarks</th>
+                <th>ILI Serial Number</th>
+                <th>QLI Serial Number</th>
                 <th>ILI Number</th>
                 <th>QLI Number</th>
                 <th>ILI PO Number</th>
@@ -488,6 +563,7 @@ function ValidationResults({ results }) {
                 <th>QLI Quantity</th>
                 <th>ILI Unit Price</th>
                 <th>QLI Unit Price</th>
+                <th>QLI CUP (computed)</th>
                 <th>LLA (effective)</th>
                 <th>LLA calculated</th>
                 <th>ELLA</th>
@@ -498,6 +574,7 @@ function ValidationResults({ results }) {
                 <th>Desc Match %</th>
                 <th>ILI Invoice Start Date</th>
                 <th>QLI Invoice Start Date</th>
+                <th>QLI Line Item Service Start Date</th>
                 <th>ILI Renewal Term</th>
                 <th>QLI Renewal Term</th>
                 <th>ILI First Price Inc After</th>
@@ -569,6 +646,11 @@ function ExcelValidation() {
       .catch(() => setRateCardConfig(null))
   }, [])
 
+  useEffect(() => {
+    autoLoadDefaultFiles()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Normalize column headers: trim leading/trailing spaces so " UNIT_SELLING_PRICE " matches expected "UNIT_SELLING_PRICE"
   const normalizeSheetKeys = (rows) => {
     if (!Array.isArray(rows) || rows.length === 0) return rows
@@ -619,45 +701,112 @@ function ExcelValidation() {
     return data
   }
 
+  const parseBufferToData = (buffer, fileName, fileType) => {
+    const workbook = XLSX.read(buffer, { type: 'array' })
+    const sheetName = workbook.SheetNames[0]
+    const worksheet = workbook.Sheets[sheetName]
+    let jsonData = XLSX.utils.sheet_to_json(worksheet)
+    const defaultKeys = jsonData.length > 0 ? Object.keys(jsonData[0] || {}) : []
+    const raw = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' })
+    const firstRowLen = (raw[0] || []).length
+    const firstRowFilled = (raw[0] || []).filter(c => c != null && String(c).trim() !== '').length
+    if (fileType === 'ratecard') {
+      jsonData = sheetToJsonRateCardWithUniqueHeaders(worksheet)
+    } else if (firstRowLen >= 5 && firstRowFilled > defaultKeys.length) {
+      jsonData = sheetToJsonWithHeaderRow(worksheet)
+    }
+    jsonData = normalizeSheetKeys(jsonData)
+    return {
+      jsonData,
+      sheets: workbook.SheetNames,
+      selectedSheet: sheetName,
+      workbook
+    }
+  }
+
+  const applyParsedData = (jsonData, sheets, selectedSheet, workbook, fileName, fileType, autoLoaded = false) => {
+    const fileInfo = {
+      name: fileName,
+      sheets,
+      selectedSheet,
+      rowCount: jsonData.length,
+      columns: jsonData.length > 0 ? Object.keys(jsonData[0]) : [],
+      data: jsonData,
+      workbook,
+      autoLoaded
+    }
+    if (fileType === 'base') {
+      setBaseFile(fileInfo)
+      setBaseData(jsonData)
+    } else if (fileType === 'quote') {
+      setQuoteFile(fileInfo)
+      setQuoteData(jsonData)
+    } else {
+      setRateCardFile(fileInfo)
+      setRateCardData(jsonData)
+    }
+  }
+
+  const loadFolderFile = async (folder, fileType) => {
+    const cacheKey = `auto-${folder}`
+    const urlBase = `/${folder}/`
+
+    // 1. Discover filename
+    const list = await fetch(`/api/list-folder?folder=${folder}`)
+      .then(r => r.ok ? r.json() : []).catch(() => [])
+    const fileName = list[0]
+    if (!fileName) return
+
+    // 2. Get current file size (cheap HEAD request)
+    const head = await fetch(`${urlBase}${encodeURIComponent(fileName)}`, { method: 'HEAD' }).catch(() => null)
+    const currentSize = head ? parseInt(head.headers.get('content-length') || '0', 10) : 0
+
+    // 3. Check cache — skip full parse if file unchanged
+    const cached = await getCached(cacheKey)
+    if (cached && cached.fileName === fileName && cached.fileSize === currentSize && currentSize > 0) {
+      applyParsedData(cached.jsonData, cached.sheets, cached.selectedSheet, null, fileName, fileType, true)
+      return
+    }
+
+    // 4. Cache miss or file changed — fetch and parse
+    const res = await fetch(`${urlBase}${encodeURIComponent(fileName)}`).catch(() => null)
+    if (!res || !res.ok) return
+    const buffer = await res.arrayBuffer()
+    const { jsonData, sheets, selectedSheet, workbook } = parseBufferToData(buffer, fileName, fileType)
+
+    // 5. Store parsed result in IndexedDB (workbook is not serializable, exclude it)
+    await setCached(cacheKey, { fileName, fileSize: buffer.byteLength, jsonData, sheets, selectedSheet })
+
+    applyParsedData(jsonData, sheets, selectedSheet, workbook, fileName, fileType, true)
+  }
+
+  const autoLoadDefaultFiles = async () => {
+    try {
+      setLoading(true)
+      await Promise.all([
+        loadFolderFile('InvoiceFile', 'base').catch(() => {}),
+        loadFolderFile('QuoteFile', 'quote').catch(() => {})
+      ])
+    } catch (err) {
+      console.log('Auto-load skipped:', err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const handleFileUpload = (file, fileType) => {
     if (!file) return
     setLoading(true)
+    // Clear cache for this slot so next auto-load re-parses the new file
+    const cacheKey = fileType === 'base' ? 'auto-InvoiceFile' : fileType === 'quote' ? 'auto-QuoteFile' : null
+    if (cacheKey) deleteCached(cacheKey)
     const reader = new FileReader()
     reader.onload = (e) => {
       try {
-        const workbook = XLSX.read(e.target.result, { type: 'binary' })
-        const sheetName = workbook.SheetNames[0]
-        const worksheet = workbook.Sheets[sheetName]
-        let jsonData = XLSX.utils.sheet_to_json(worksheet)
-        const defaultKeys = jsonData.length > 0 ? Object.keys(jsonData[0] || {}) : []
-        const raw = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' })
-        const firstRowLen = (raw[0] || []).length
-        const firstRowFilled = (raw[0] || []).filter(c => c != null && String(c).trim() !== '').length
-        if (fileType === 'ratecard') {
-          jsonData = sheetToJsonRateCardWithUniqueHeaders(worksheet)
-        } else if (firstRowLen >= 5 && firstRowFilled > defaultKeys.length) {
-          jsonData = sheetToJsonWithHeaderRow(worksheet)
-        }
-        jsonData = normalizeSheetKeys(jsonData)
-        const fileInfo = {
-          name: file.name,
-          sheets: workbook.SheetNames,
-          selectedSheet: sheetName,
-          rowCount: jsonData.length,
-          columns: jsonData.length > 0 ? Object.keys(jsonData[0]) : [],
-          data: jsonData,
-          workbook
-        }
-        if (fileType === 'base') {
-          setBaseFile(fileInfo)
-          setBaseData(jsonData)
-        } else if (fileType === 'quote') {
-          setQuoteFile(fileInfo)
-          setQuoteData(jsonData)
-        } else {
-          setRateCardFile(fileInfo)
-          setRateCardData(jsonData)
-        }
+        const buffer = e.target.result
+        const uint8 = new Uint8Array(buffer)
+        const { jsonData, sheets, selectedSheet, workbook } = parseBufferToData(uint8, file.name, fileType)
+        applyParsedData(jsonData, sheets, selectedSheet, workbook, file.name, fileType, false)
         setLoading(false)
       } catch (error) {
         console.error('Error reading file:', error)
@@ -665,7 +814,7 @@ function ExcelValidation() {
         setLoading(false)
       }
     }
-    reader.readAsBinaryString(file)
+    reader.readAsArrayBuffer(file)
   }
 
   const clearFile = (fileType) => {
@@ -767,7 +916,7 @@ function ExcelValidation() {
   return (
     <div className="excel-validation-container">
       <header className="validation-header">
-        <h1>Invoice vs Quote Validation</h1>
+        <h1>Equinix Automation</h1>
         <p>Two files: Base (Invoice line items) and Quote (Quote line items). Validate by PO, IBX, product/charge, price, and quantity.</p>
       </header>
 
@@ -779,7 +928,7 @@ function ExcelValidation() {
             <li><strong>Base File (Invoice):</strong> Book1-style with TRX_NUMBER, LINE_NUMBER, SERIAL_NUMBER, PO_NUMBER, IBX, ITEM_NUMBER/PRODUCT_CODE, DESCRIPTION, QUANTITY, UNIT_SELLING_PRICE, LINE_LEVEL_AMOUNT. Optional: BILLING_FROM, BILLING_TILL.</li>
             <li><strong>Quote File:</strong> Po Number, Site ID/IBX, Item Code, Item Description, Changed Item Description, Quantity, Unit Price (OTC/MRC). Optional: service_start_date, initial_term, term, Initial_term_Increment, Increment, contract_period_in_months.</li>
           </ul>
-          <p className="tip">Outcomes: <strong>Passed</strong> (all match), <strong>Failed</strong> (e.g. price/quantity anomaly), <strong>Skipped</strong> (no QLIs or no matching QLI).</p>
+          <p className="tip">Outcomes: <strong>Passed</strong> (all match), <strong>Failed</strong> (quote price/qty fail, or no quote match). <strong>Quote skipped at</strong> / <strong>Quote skip remarks</strong> columns show the stage (Serial, IBX, Currency, Description, etc.) and why quote validation did not complete.</p>
           <p className="tip">Optional <strong>Rate Card File</strong>: Upload to validate <strong>Skipped</strong> lines against rate card (Space &amp; Power, Power Install NRC, Secure Cabinet Express, etc.). Uses same price tolerance. Config: <code>public/rate-card-types.json</code>.</p>
         </div>
       </div>
@@ -801,7 +950,10 @@ function ExcelValidation() {
           ) : (
             <div className="file-info">
               <div className="file-details">
-                <p className="file-name"><strong>{baseFile.name}</strong></p>
+                <p className="file-name">
+                  <strong>{baseFile.name}</strong>
+                  {baseFile.autoLoaded && <span className="auto-loaded-badge">⚡ Auto-loaded</span>}
+                </p>
                 <div className="file-stats">
                   <span className="stat-badge">📊 {baseFile.rowCount.toLocaleString()} rows</span>
                   <span className="stat-badge">📋 {baseFile.columns.length} columns</span>
@@ -835,7 +987,10 @@ function ExcelValidation() {
           ) : (
             <div className="file-info">
               <div className="file-details">
-                <p className="file-name"><strong>{quoteFile.name}</strong></p>
+                <p className="file-name">
+                  <strong>{quoteFile.name}</strong>
+                  {quoteFile.autoLoaded && <span className="auto-loaded-badge">⚡ Auto-loaded</span>}
+                </p>
                 <div className="file-stats">
                   <span className="stat-badge">📊 {quoteFile.rowCount.toLocaleString()} rows</span>
                   <span className="stat-badge">📋 {quoteFile.columns.length} columns</span>
