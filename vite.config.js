@@ -5,6 +5,13 @@ import path from 'path'
 
 // https://vite.dev/config/
 export default defineConfig({
+  server: {
+    watch: {
+      // Windows can miss fs events on some folders/paths; polling is more reliable.
+      usePolling: true,
+      interval: 200
+    }
+  },
   plugins: [
     react(),
     {

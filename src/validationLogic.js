@@ -6,9 +6,16 @@
 import { validateWithRateCard, formatDateForDisplay, parseDate } from './rateCardValidation.js'
 import { calculateCDSimilarity, parseSentence as parseSentenceCD } from './cdValidationParser.js'
 
+export const QUOTE_VALIDATION_LOGIC_VERSION = `logic-${new Date().toISOString()}`
 
 const QLI_PO_VARIANTS = "Po Number"
 const QLI_SERIAL_VARIANTS = ['Serial Number', 'serial_number', 'SERIAL_NUMBER']
+const ILI_UNIT_PRICE_VARIANTS = ['UNIT_SELLING_PRICE', 'unit_selling_price', 'Unit Selling Price', 'UNIT_PRICE', 'unit_price', 'Selling Price', 'Unit Price']
+const ILI_QUANTITY_VARIANTS = ['QUANTITY', 'quantity', 'Quantity', 'QTY', 'qty']
+const ILI_LLA_VARIANTS = ['LINE_LEVEL_AMOUNT', 'line_level_amount', 'Line Level Amount', 'LLA', 'lla', 'LINE LEVEL AMOUNT', 'LineLevelAmount']
+const ILI_RECURRING_CHARGE_TO_VARIANTS = ['RECURRING_CHARGE_TO_DATE', 'recurring_charge_to_date', 'Recurring Charge To Date', 'BILLING_TILL', 'billing_till', 'Billing Till']
+const ILI_RECURRING_CHARGE_FROM_VARIANTS = ['RECURRING_CHARGE_FROM_DATE', 'recurring_charge_from_date', 'Recurring Charge From Date', 'BILLING_FROM', 'billing_from', 'Billing From']
+const ILI_SERVICE_START_VARIANTS = ['SERVICE_START_DATE', 'service_start_date', 'Service Start Date', 'Invoice Start Date']
 const QLI_SITE_VARIANTS = "Site Id"
 const QLI_PRODUCT_CODE_VARIANTS = "Item Code"
 const QLI_CHARGE_DESC_VARIANTS = "Item Description"
@@ -37,6 +44,20 @@ function getExpectedResultFromBaseRow(row) {
   return first === 'Y' ? 'P' : first === 'N' ? 'F' : ''
 }
 
+function normalizeKeyForMatch(k) {
+  return String(k ?? '').replace(/[\s_\-]/g, '').toLowerCase()
+}
+
+function findKeyInRow(row, variants) {
+  if (!row || typeof row !== 'object') return null
+  const vNorm = new Set(Array.isArray(variants) ? variants.map(normalizeKeyForMatch) : [normalizeKeyForMatch(variants)])
+  for (const key of Object.keys(row)) {
+    const kNorm = normalizeKeyForMatch(key)
+    if (vNorm.has(kNorm)) return key
+  }
+  return null
+}
+
 function getValue(row, key) {
   if (!row || key == null) return ''
   if (Array.isArray(key)) {
@@ -44,6 +65,8 @@ function getValue(row, key) {
       const v = getValue(row, k)
       if (v !== '') return v
     }
+    const found = findKeyInRow(row, key)
+    if (found) return (row[found] != null && row[found] !== '') ? String(row[found]).trim() : ''
     return ''
   }
   const val = row[key]
@@ -57,6 +80,8 @@ function getNumeric(row, key) {
       const v = getNumeric(row, k)
       if (!isNaN(v)) return v
     }
+    const found = findKeyInRow(row, key)
+    if (found) return getNumeric(row, found)
     return NaN
   }
   const val = row[key]
@@ -80,15 +105,31 @@ function normalizeText(text) {
  * Similarity = (Jaccard(contains) + Jaccard(value_matches)) / 2; pass if >= 80.
  */
 
-/** Format parsed CD tokens for UI display (contains + value_matches). */
+// /** Format parsed CD tokens for UI display (contains + value_matches). */
+// function formatCDTokensForDisplay(parsed) {
+//   if (!parsed || (!parsed.contains?.length && !parsed.value_matches?.length)) return ''
+//   const parts = []
+//   if (parsed.contains?.length) parts.push([...parsed.contains].join(', '))
+//   if (parsed.value_matches?.length) parts.push([...parsed.value_matches].join(', '))
+//   return parts.join('; ')
+// }
 function formatCDTokensForDisplay(parsed) {
-  if (!parsed || (!parsed.contains?.length && !parsed.value_matches?.length)) return ''
+  if (!parsed) return ''
   const parts = []
-  if (parsed.contains?.length) parts.push([...parsed.contains].join(', '))
-  if (parsed.value_matches?.length) parts.push([...parsed.value_matches].join(', '))
-  return parts.join('; ')
+  if (parsed.level_matches?.length) {
+    parsed.level_matches.forEach(({ label, matches }, i) => {
+      const levelLabel = i === 0 ? 'Cat' : i === 1 ? 'Sub' : i === 2 ? 'Detail' : `L${i + 1}`
+      // Show siblings in brackets if more than one: "Detail: Single-Mode Fiber [+UTP]"
+      const display = matches.length > 1
+        ? `${label} [+${matches.slice(1).join(', ')}]`
+        : label
+      parts.push(`${levelLabel}: ${display}`)
+    })
+  }
+  if (parsed.value_matches?.length) parts.push(parsed.value_matches.join(', '))
+  return parts.join(' | ')
 }
-
+ 
 function descriptionMatchScore(iliDesc, qliDesc) {
   if (!qliDesc || String(qliDesc).trim().length < 2) return { passes: false, matchCount: 0 }
   const s1 = String(iliDesc ?? '').trim()
@@ -150,13 +191,20 @@ function getDescMatchScore(iliDesc, qliChargeDesc, qliChangeDesc) {
 const QLI_SERVICE_START_VARIANTS = ['line_item_service_start_date', 'Line Item Service Start Date', 'line item service start date']
 
 function getCUP(quoteItem, ili) {
-  const rawUnitPrice = getNumeric(quoteItem, QLI_UNIT_PRICE_VARIANTS)
-  if (rawUnitPrice === 0 || isNaN(rawUnitPrice)) return NaN
+  let rawUnitPrice = getNumeric(quoteItem, QLI_UNIT_PRICE_VARIANTS)
+  if (rawUnitPrice === 0 || isNaN(rawUnitPrice)) {
+    const fallback = getQLIUnitPriceFromTotal(quoteItem)
+    if (!isNaN(fallback.price) && fallback.price !== 0) {
+      rawUnitPrice = fallback.price
+    } else {
+      return NaN
+    }
+  }
   const unitPrice = Math.abs(rawUnitPrice)
 
-  const invoiceDate = parseDate(getValue(ili, "RECURRING_CHARGE_TO_DATE"))
+  const invoiceDate = parseDate(getValue(ili, ILI_RECURRING_CHARGE_TO_VARIANTS))
   const qliServiceStartVal = getValue(quoteItem, QLI_SERVICE_START_VARIANTS)
-  const serviceStart = parseDate(qliServiceStartVal) || parseDate(getValue(ili, "SERVICE_START_DATE"))
+  const serviceStart = parseDate(qliServiceStartVal) || parseDate(getValue(ili, ILI_SERVICE_START_VARIANTS))
   if (!serviceStart || !invoiceDate) {
     const cupMagnitude = Math.round(unitPrice * 100) / 100
     const qliQty = getQLIQuantity(quoteItem)
@@ -225,8 +273,8 @@ function addMonths(date, months) {
  * Returns 1 if billing_from/billing_till missing or invalid.
  */
 export function getPF(ili, billingFrom, billingTill) {
-  const from = parseDate(billingFrom) || parseDate(getValue(ili, "RECURRING_CHARGE_FROM_DATE"))
-  const till = parseDate(billingTill) || parseDate(getValue(ili, "RECURRING_CHARGE_TO_DATE"))
+  const from = parseDate(billingFrom) || parseDate(getValue(ili, ILI_RECURRING_CHARGE_FROM_VARIANTS))
+  const till = parseDate(billingTill) || parseDate(getValue(ili, ILI_RECURRING_CHARGE_TO_VARIANTS))
   if (!from || !till) return 1
   const daysInMonth = new Date(from.getFullYear(), from.getMonth() + 1, 0).getDate()
   const days = Math.max(0, (till - from) / (24 * 60 * 60 * 1000)) + 1
@@ -274,7 +322,7 @@ function getQLIUnitPriceFromTotal(qli) {
   for (const col of QLI_TOTAL_FALLBACK_COLS) {
     const total = getNumeric(qli, col)
     if (!isNaN(total) && total !== 0) {
-      return { price: total / qty, source: col }
+      return { price: total/qty , source: col }
     }
   }
   return { price: NaN, source: null }
@@ -356,9 +404,9 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
 
   const ibx = getValue(ili, "IBX") || ''
   const chargeDesc = getValue(ili, "DESCRIPTION") || ''
-  let quantity = getNumeric(ili, "QUANTITY")
-  let unitPrice = getNumeric(ili, "UNIT_SELLING_PRICE")
-  let lla = getNumeric(ili, "LINE_LEVEL_AMOUNT")
+  let quantity = getNumeric(ili, ILI_QUANTITY_VARIANTS)
+  let unitPrice = getNumeric(ili, ILI_UNIT_PRICE_VARIANTS)
+  let lla = getNumeric(ili, ILI_LLA_VARIANTS)
   
 
   if (isNaN(quantity)) quantity = 0
@@ -419,15 +467,39 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
   // With currency filter off: use QLIs that passed IBX for further matching
   let qlisForMatch = qlisByIbx
 
-  // Quantity sign filter: if ILI quantity is negative, only validate against QLIs with negative quantity.
-  // (Requested: negative ILI → negative QLI)
-  if (quantity < 0) {
+  // Quantity sign filter: positive ILI → only positive QLI; negative ILI → only negative QLI.
+  if (quantity > 0) {
+    qlisForMatch = qlisForMatch.filter(qli => {
+      const q = getQLIQuantity(qli)
+      return !isNaN(q) && q > 0
+    })
+    if (qlisForMatch.length === 0) {
+      return { result: null, remarks: 'ILI quantity is positive; no QLI with positive quantity for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Quantity sign)' }
+    }
+  } else if (quantity < 0) {
     qlisForMatch = qlisForMatch.filter(qli => {
       const q = getQLIQuantity(qli)
       return !isNaN(q) && q < 0
     })
     if (qlisForMatch.length === 0) {
       return { result: null, remarks: 'ILI quantity is negative; no QLI with negative quantity for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Quantity sign)' }
+    }
+  }
+
+  // Charge type preference: RC/MRC ILIs prefer MRC QLIs; NRC/OTC ILIs prefer NRC/OTC QLIs.
+  const iliChargeType = getValue(ili, ['CHARGE_TYPE', 'charge_type']).toUpperCase()
+  if (iliChargeType) {
+    const iliIsRecurring = iliChargeType === 'RC' || iliChargeType === 'MRC'
+    const iliIsNonRecurring = iliChargeType === 'NRC' || iliChargeType === 'OTC'
+    if (iliIsRecurring || iliIsNonRecurring) {
+      const ctFiltered = qlisForMatch.filter(qli => {
+        const qliCT = getValue(qli, ['line_item_charge_type', 'charge_type']).toUpperCase()
+        if (iliIsRecurring) return qliCT === 'MRC' || qliCT === 'RC'
+        return qliCT === 'NRC' || qliCT === 'OTC'
+      })
+      if (ctFiltered.length > 0) {
+        qlisForMatch = ctFiltered
+      }
     }
   }
 
@@ -462,7 +534,18 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
     if (itemCodeCandidates.length > 0) {
       let best = itemCodeCandidates[0]
       for (let i = 1; i < itemCodeCandidates.length; i++) {
-        if (itemCodeCandidates[i].matchCount > best.matchCount) best = itemCodeCandidates[i]
+        const cand = itemCodeCandidates[i]
+        if (cand.matchCount > best.matchCount) {
+          best = cand
+        } else if (cand.matchCount === best.matchCount) {
+          const bestCup = getCUP(best.qli, ili)
+          const candCup = getCUP(cand.qli, ili)
+          const bestCupVal = !isNaN(bestCup) ? Math.abs(bestCup) : getNumeric(best.qli, QLI_UNIT_PRICE_VARIANTS)
+          const candCupVal = !isNaN(candCup) ? Math.abs(candCup) : getNumeric(cand.qli, QLI_UNIT_PRICE_VARIANTS)
+          const bestVal = !isNaN(bestCupVal) ? bestCupVal : Infinity
+          const candVal = !isNaN(candCupVal) ? candCupVal : Infinity
+          if (candVal < bestVal) best = cand
+        }
       }
       return validateWithQLI(best.qli)
     }
@@ -501,7 +584,19 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
   if (descCandidates.length > 0) {
     let best = descCandidates[0]
     for (let i = 1; i < descCandidates.length; i++) {
-      if (descCandidates[i].matchCount > best.matchCount) best = descCandidates[i]
+      const cand = descCandidates[i]
+      if (cand.matchCount > best.matchCount) {
+        best = cand
+      } else if (cand.matchCount === best.matchCount) {
+        // Tiebreaker: prefer QLI with LOWEST unit price (strictest validation - fail when ILI exceeds)
+        const bestCup = getCUP(best.qli, ili)
+        const candCup = getCUP(cand.qli, ili)
+        const bestCupVal = !isNaN(bestCup) ? Math.abs(bestCup) : getNumeric(best.qli, QLI_UNIT_PRICE_VARIANTS)
+        const candCupVal = !isNaN(candCup) ? Math.abs(candCup) : getNumeric(cand.qli, QLI_UNIT_PRICE_VARIANTS)
+        const bestVal = !isNaN(bestCupVal) ? bestCupVal : Infinity
+        const candVal = !isNaN(candCupVal) ? candCupVal : Infinity
+        if (candVal < bestVal) best = cand
+      }
     }
     selectedQLI = best.qli
   }
@@ -512,8 +607,11 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
 
   // Run price/LLA/quantity validation for one QLI; returns result object.
   function validateWithQLI(qli) {
-    if (unitPrice === 0 && lla === 0 ||unitPrice==''&& lla==''||isNaN(unitPrice)&&isNaN(lla)) {
+    if (unitPrice === 0 && lla === 0 || unitPrice === '' && lla === '') {
       return { result: 'validated', remarks: 'Unit Price and LLA are zero; no charge.', matchedQLI: qli, validationStep: 'Quote - Passed (No charge)', effectiveLla: 0, llaCalculated, ella: NaN, cup: NaN, fallbackUnitPrice: NaN, fallbackUnitPriceSource: null }
+    }
+    if (isNaN(unitPrice) && isNaN(lla)) {
+      return { result: 'failed', remarks: 'Cannot validate: ILI unit price and LLA are missing or invalid.', matchedQLI: qli, validationStep: 'Quote - Failed (Unit price)', effectiveLla: lla, llaCalculated, ella: NaN, cup: NaN, fallbackUnitPrice: NaN, fallbackUnitPriceSource: null }
     }
     const cup = getCUP(qli, ili)
 
@@ -530,8 +628,11 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
       }
     }
 
-    const cup_within_tolerance_raw = effectiveCup * (1 + priceTolerance)
-    const cup_within_tolerance = Math.round(cup_within_tolerance_raw * 100) / 100
+    // When quantity is negative, use negative tolerance; when positive, use positive tolerance.
+    const signedPriceTolerance = quantity < 0 ? -priceTolerance : priceTolerance
+    // Unit price threshold: CUP * (1 + signedTolerance) so negative qty → CUP*(1-tolerance), positive qty → CUP*(1+tolerance)
+    const unitPriceThresholdRaw = effectiveCup * (1 + signedPriceTolerance)
+    const unitPriceThreshold = Math.round(unitPriceThresholdRaw * 100) / 100
     if (isNaN(effectiveCup) || effectiveCup === 0) {
       return { result: 'failed', remarks: 'No valid quote unit price (CUP) for date.', matchedQLI: qli, validationStep: 'Quote - Failed (No CUP)', effectiveLla: lla, llaCalculated, ella: NaN, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
     }
@@ -543,24 +644,63 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
     const normFactor = pf > 0 && pf < 1 ? 1 / pf : 1
     const unitPriceForCompare = normFactor === 1 ? unitPrice : (isNaN(unitPrice) ? unitPrice : unitPrice * normFactor)
     const llaForCompare = normFactor === 1 ? lla : (isNaN(lla) ? lla : lla * normFactor)
-    const unitPriceExceedsTolerance = effectiveCup > 0
-      ? unitPriceForCompare > cup_within_tolerance
-      : unitPriceForCompare > cup_within_tolerance
-    if (unitPriceExceedsTolerance) {
+    // Fail when ILI unit price missing (NaN) - cannot validate; or when it exceeds CUP*(1+tolerance)
+    // Note: NaN > x is false in JS, so we must explicitly check for NaN to fail when unit price is missing
+    const unitPriceMissingOrInvalid = (isNaN(unitPriceForCompare) || unitPriceForCompare == null) && !isNaN(effectiveCup) && effectiveCup !== 0
+    const unitPriceExceedsTolerance = !isNaN(unitPriceForCompare) && (unitPriceForCompare) > (unitPriceThreshold)
+    if (unitPriceExceedsTolerance || unitPriceMissingOrInvalid) {
       const ella = effectiveCup * quantity * pf
       const upDisplay = !isNaN(unitPrice) ? unitPrice.toFixed(2) : 'N/A'
-      return { result: 'failed', remarks: `Unit price ${upDisplay} exceeds CUP*(1+tolerance)=${cup_within_tolerance}${fallbackNote}`, matchedQLI: qli, validationStep: 'Quote - Failed (Unit price)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
+      const remarks = unitPriceMissingOrInvalid
+        ? `Cannot validate: ILI unit price missing or invalid. QLI CUP=${unitPriceThreshold.toFixed(2)}${fallbackNote}`
+        : `Unit price ${upDisplay} exceeds CUP*(1+tolerance)=${unitPriceThreshold}${fallbackNote}`
+      return { result: 'failed', remarks, matchedQLI: qli, validationStep: 'Quote - Failed (Unit price)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource, unitPriceForCompare, cup_within_tolerance: unitPriceThreshold, effectiveCup }
+    }
+
+    const finalizePass = (validationStep, remarks, qliQtyForMsg) => {
+      const upDisplay = !isNaN(unitPrice) ? unitPrice.toFixed(2) : 'N/A'
+      const qQtyDisplay = qliQtyForMsg !== undefined ? qliQtyForMsg : getQLIQuantity(qli)
+      if (!isNaN(unitPriceForCompare) && (unitPriceForCompare) > (unitPriceThreshold)) {
+        const ella = effectiveCup * quantity * pf
+        return {
+          result: 'failed',
+          remarks: `Unit price ${upDisplay} exceeds CUP*(1+tolerance)=${unitPriceThreshold}${fallbackNote}`,
+          matchedQLI: qli,
+          validationStep: 'Quote - Failed (Unit price)',
+          effectiveLla: lla,
+          llaCalculated,
+          ella,
+          cup: effectiveCup,
+          fallbackUnitPrice,
+          fallbackUnitPriceSource,
+          unitPriceForCompare,
+          cup_within_tolerance: unitPriceThreshold,
+          effectiveCup
+        }
+      }
+      return {
+        result: 'validated',
+        remarks,
+        matchedQLI: qli,
+        validationStep,
+        effectiveLla: lla,
+        llaCalculated,
+        ella,
+        cup: effectiveCup,
+        fallbackUnitPrice,
+        fallbackUnitPriceSource,
+        qliQty: qQtyDisplay,
+        unitPriceForCompare,
+        cup_within_tolerance: unitPriceThreshold,
+        effectiveCup
+      }
     }
     const qtyILI = quantity
-    if (qtyILI<0){
-      var priceTolerance=-1*priceTolerance;
-    }
-    // Signed comparison only: ELLA same sign as CUP (and qty). For negative qty we compare -15 vs -14.58, never |15| vs |14.58|.
+    // signedPriceTolerance already set above (negative when qty < 0, positive when qty > 0)
+    // Signed comparison only: ELLA same sign as CUP (and qty).
     const ella = effectiveCup * Math.abs(qtyILI) * pf
-    const ellaTol = ella * (1 + priceTolerance)
-    const llaExceedsElla = qtyILI > 0
-      ? llaForCompare > ellaTol
-      : llaForCompare > ellaTol
+    const ellaTol = ella * (1 + signedPriceTolerance)
+    const llaExceedsElla = llaForCompare > ellaTol
     if (!isNaN(llaForCompare) && llaExceedsElla) {
       const msg = qtyILI < 0
         ? `LLA ${lla.toFixed(2)} is more negative than allowed ELLA*(1+tolerance)=${(ellaTol).toFixed(2)}${fallbackNote}`
@@ -569,13 +709,17 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
     }
     const qliQty = getQLIQuantity(qli)
     if (isNaN(qliQty) || qliQty === 0) {
-      return { result: 'validated', remarks: `No quote quantity on matched QLI.${fallbackNote}`, matchedQLI: qli, validationStep: 'Quote - Passed (No quote quantity)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
+      return finalizePass('Quote - Passed (No quote quantity)', `No quote quantity on matched QLI.${fallbackNote}`, qliQty)
     }
     const qtyExceedsQuote = Math.abs(qtyILI) > Math.abs(qliQty) * (1 + qtyTolerance)
     if (qtyExceedsQuote) {
-      return { result: 'validated', remarks: `All validations passed (Quantity mismatch: ILI qty ${qtyILI} exceeds QLI qty ${qliQty} * (1+${(qtyTolerance * 100).toFixed(0)}%))${fallbackNote}`, matchedQLI: qli, validationStep: 'Quote - Passed (Qty mismatch)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
+      return finalizePass(
+        'Quote - Passed (Qty mismatch)',
+        `All validations passed (Quantity mismatch: ILI qty ${qtyILI} exceeds QLI qty ${qliQty} * (1+${(qtyTolerance * 100).toFixed(0)}%))${fallbackNote}`,
+        qliQty
+      )
     }
-    return { result: 'validated', remarks: `All validations passed.${fallbackNote}`, matchedQLI: qli, validationStep: 'Quote - Passed', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
+    return finalizePass('Quote - Passed', `All validations passed.${fallbackNote}`, qliQty)
   }
 
   const qli = selectedQLI
@@ -623,20 +767,20 @@ export function runValidation(baseData, quoteData, options = {}) {
       ili_category: getValue(ili, ['CATEGORY', 'category']),
       ili_charge_type: getValue(ili, ['CHARGE_TYPE', 'charge_type']),
       ili_item_code: getValue(ili, "PRODUCT_CODE") || '',
-      unit_price: getNumeric(ili, "UNIT_SELLING_PRICE"),
-      quantity: getNumeric(ili, "QUANTITY"),
-      lla: getNumeric(ili, "LINE_LEVEL_AMOUNT"),
+      unit_price: getNumeric(ili, ILI_UNIT_PRICE_VARIANTS),
+      quantity: getNumeric(ili, ILI_QUANTITY_VARIANTS),
+      lla: getNumeric(ili, ILI_LLA_VARIANTS),
       ili_description: iliDesc,
       ili_desc_tokens: formatCDTokensForDisplay(parseSentenceCD(iliDesc)),
       qli_desc_tokens: '',
       desc_match_percentage: '',
       // check from down (dates formatted for display: Excel serial -> YYYY-MM-DD)
-      ili_invoice_start_date: formatDateForDisplay(getValue(ili, "SERVICE_START_DATE")),
+      ili_invoice_start_date: formatDateForDisplay(getValue(ili, ILI_SERVICE_START_VARIANTS)),
       ili_renewal_term: getValue(ili, "RENEWAL_TERM"),
       ili_first_Price_increment_applicable_after: getValue(ili, "FIRST_PRICE_INC_APP_AFTER"),
       ili_price_increase_percentage: getValue(ili, "PRICE_INCREASE_PERCENTAGE"),
-      ili_billing_from: formatDateForDisplay(getValue(ili, "RECURRING_CHARGE_FROM_DATE")),
-      ili_billing_till: formatDateForDisplay(getValue(ili, "RECURRING_CHARGE_TO_DATE")),
+      ili_billing_from: formatDateForDisplay(getValue(ili, ILI_RECURRING_CHARGE_FROM_VARIANTS)),
+      ili_billing_till: formatDateForDisplay(getValue(ili, ILI_RECURRING_CHARGE_TO_VARIANTS)),
       prorata_factor: getPF(ili),
       expected_result: getExpectedResultFromBaseRow(ili),
       validation_result: '',
@@ -679,7 +823,7 @@ export function runValidation(baseData, quoteData, options = {}) {
       continue
     }
 
-    const { result, remarks, matchedQLI, validationStep, effectiveLla, llaCalculated, ella, cup, fallbackUnitPrice, fallbackUnitPriceSource } = validateILIAgainstQLIs(ili, qlis, options)
+    const { result, remarks, matchedQLI, validationStep, effectiveLla, llaCalculated, ella, cup, fallbackUnitPrice, fallbackUnitPriceSource, unitPriceForCompare, cup_within_tolerance, effectiveCup } = validateILIAgainstQLIs(ili, qlis, options)
     baseResult.remarks = remarks
     baseResult.validation_step = validationStep || ''
     if (effectiveLla !== undefined) {
@@ -688,6 +832,9 @@ export function runValidation(baseData, quoteData, options = {}) {
     }
     if (ella !== undefined && !isNaN(ella)) baseResult.ella = ella
     if (cup !== undefined && !isNaN(cup)) baseResult.qli_cup = cup
+    if (unitPriceForCompare !== undefined && !isNaN(unitPriceForCompare)) baseResult.unit_price_for_compare = unitPriceForCompare
+    if (cup_within_tolerance !== undefined && !isNaN(cup_within_tolerance)) baseResult.qli_cup_within_tolerance = cup_within_tolerance
+    if (effectiveCup !== undefined && !isNaN(effectiveCup)) baseResult.qli_effective_cup = effectiveCup
     if (matchedQLI) {
       baseResult.qli_number = getValue(matchedQLI, ['Number', 'QLI_NUMBER', 'Line Number', 'line_number'])
       baseResult.qli_serial_number = getQLISerial(matchedQLI)
@@ -775,6 +922,8 @@ export function runValidation(baseData, quoteData, options = {}) {
       if (rcResult.rc_effective_till !== undefined) results[i].rc_effective_till = formatDateForDisplay(rcResult.rc_effective_till)
       if (rcResult.rc_u_country !== undefined) results[i].rc_u_country = rcResult.rc_u_country
       if (rcResult.rc_u_region !== undefined) results[i].rc_u_region = rcResult.rc_u_region
+      if (rcResult.rc_desc !== undefined) results[i].rc_desc = rcResult.rc_desc
+      if (rcResult.rc_desc_tokens !== undefined) results[i].rc_desc_tokens = rcResult.rc_desc_tokens
       if (rcResult.rc_unit_price_used !== undefined && rcResult.rc_unit_price_used !== '') results[i].rc_unit_price_used = rcResult.rc_unit_price_used
       if (rcResult.rc_u_pricekva !== undefined && rcResult.rc_u_pricekva !== '') results[i].rc_u_pricekva = rcResult.rc_u_pricekva
       if (rcResult.rc_u_rate !== undefined && rcResult.rc_u_rate !== '') results[i].rc_u_rate = rcResult.rc_u_rate
@@ -807,6 +956,7 @@ export function runValidation(baseData, quoteData, options = {}) {
     passedCount,
     failedCount,
     validationResults: results,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    logicVersion: QUOTE_VALIDATION_LOGIC_VERSION
   }
 }

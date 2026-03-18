@@ -10,6 +10,8 @@
 * - CUP = Unit Price of RLI (rate card line). If both 0 → Pass; if ILI unit price > CUP * (1 + tolerance) → Failed.
 */
  
+import { calculateCDSimilarity, parseSentence as parseSentenceCD } from './cdValidationParser.js'
+
 // Fallback effective window when rate card has no valid Effective From/Till (e.g. empty file)
 const EFFECTIVE_FROM_FALLBACK = '2025-04-01'
 const EFFECTIVE_TILL_FALLBACK = '2026-03-31'
@@ -53,6 +55,22 @@ const RC_CURR_VARIANTS = RC_CURRENCY_VARIANTS
 const RC_CATEGORY_VARIANTS = ['u_category', 'category', 'CATEGORY', 'Category']
 const RC_CHARGE_TYPE_VARIANTS = ['u_charge_type', 'charge_type', 'CHARGE_TYPE', 'Charge Type']
  
+function formatCDTokensForDisplay(parsed) {
+  if (!parsed) return ''
+  const parts = []
+  if (parsed.level_matches?.length) {
+    parsed.level_matches.forEach(({ label, matches }, i) => {
+      const levelLabel = i === 0 ? 'Cat' : i === 1 ? 'Sub' : i === 2 ? 'Detail' : `L${i + 1}`
+      const display = matches.length > 1
+        ? `${label} [+${matches.slice(1).join(', ')}]`
+        : label
+      parts.push(`${levelLabel}: ${display}`)
+    })
+  }
+  if (parsed.value_matches?.length) parts.push(parsed.value_matches.join(', '))
+  return parts.join(' | ')
+}
+
 function getValue(row, variants) {
   if (!row) return ''
   for (const v of variants) {
@@ -308,24 +326,71 @@ function preFilterRateCardByIliAttributes(rateCardData, ili, serviceStartDate) {
   const region = getIliRegion(ili)
   const iliIbx = getIliIbx(ili)
   const iliCurr = getIliCurr(ili)
-  const iliCategory = getIliCategory(ili)
 
-  return (rateCardData || []).filter(rc => {
+  const key = `${String(iliCurr || '').trim().toUpperCase()}|${String(country || '').trim()}|${String(region || '').trim().toUpperCase()}`
+  const base = (rateCardData && rateCardData.__byTriple && rateCardData.__byTriple.get(key)) ? rateCardData.__byTriple.get(key) : (rateCardData || [])
+
+  return base.filter(rc => {
     const rcCurrency = getValue(rc, RC_CURRENCY_VARIANTS)
-    if (iliCurr && rcCurrency && String(rcCurrency).trim().toUpperCase() !== String(iliCurr).trim().toUpperCase()) return false
-    const rcRateCardType = getValue(rc, RC_RATE_CARD_TYPE_VARIANTS)
-    if (iliCategory && rcRateCardType && String(rcRateCardType).trim().toUpperCase() !== String(iliCategory).trim().toUpperCase()) return false
+    if (iliCurr) {
+      if (!rcCurrency) return false
+      if (String(rcCurrency).trim().toUpperCase() !== String(iliCurr).trim().toUpperCase()) return false
+    }
     const rcCountry = getValue(rc, RC_COUNTRY_VARIANTS)
-    if (country && rcCountry && rcCountry !== country) return false
+    if (country) {
+      if (!rcCountry) return false
+      if (rcCountry !== country) return false
+    }
     const rcRegion = getValue(rc, RC_REGION_VARIANTS)
-    if (region && rcRegion && rcRegion !== region) return false
-    const effFrom = parseDate(getValue(rc, RC_EFFECTIVE_FROM_VARIANTS))
-    const effTill = parseDate(getValue(rc, RC_EFFECTIVE_TILL_VARIANTS))
-    if (effFrom && serviceStartDate < effFrom) return false
-    if (effTill && serviceStartDate >= effTill) return false
+    if (region) {
+      if (!rcRegion) return false
+      if (rcRegion !== region) return false
+    }
+    // Service start date filter intentionally skipped (user requirement).
     if (!rateCardAppliesToIbx(rc, iliIbx)) return false
     return true
   })
+}
+
+/**
+ * Rate card CD matching: build a synthetic description for an RC row (since there's no single description column).
+ * We concatenate key identifying fields and let CD similarity choose the best RC row.
+ */
+function buildRateCardDesc(rcRow) {
+  const parts = [
+    getValue(rcRow, RC_RATE_CARD_TYPE_VARIANTS),
+    getValue(rcRow, RC_SUB_TYPE_VARIANTS),
+    getValue(rcRow, RC_RATE_CARD_VARIANTS),
+    getValue(rcRow, RC_GOODS_SERVICES_VARIANTS),
+    getValue(rcRow, RC_PARAMETER1_VARIANTS),
+    getValue(rcRow, RC_PARAMETER2_VARIANTS),
+    getValue(rcRow, ['u_product_name', 'product_name', 'Product Name']),
+    getValue(rcRow, ['u_circuit_type', 'circuit_type', 'Circuit Type']),
+    getValue(rcRow, ['u_bandwidth', 'bandwidth', 'Bandwidth']),
+    getValue(rcRow, ['u_metro', 'metro', 'Metro']),
+    getValue(rcRow, ['u_term', 'term', 'Term']),
+    getValue(rcRow, ['u_uom', 'uom', 'UOM']),
+    getValue(rcRow, ['u_equipment', 'equipment', 'Equipment']),
+    getValue(rcRow, ['u_ip_type', 'ip_type', 'IP Type']),
+    getValue(rcRow, ['u_media_type', 'media_type', 'Media Type']),
+    getValue(rcRow, ['u_sub_type', 'sub_type', 'Sub Type']),
+    getValue(rcRow, ['u_service_provider', 'service_provider', 'Service Provider'])
+  ]
+  return parts.map(s => String(s || '').trim()).filter(Boolean).join(' | ')
+}
+
+function ensureRateCardIndex(rateCardData) {
+  if (!rateCardData || !Array.isArray(rateCardData)) return
+  if (rateCardData.__byTriple) return
+  Object.defineProperty(rateCardData, '__byTriple', { value: new Map(), enumerable: false })
+  for (const rc of rateCardData) {
+    const curr = String(getValue(rc, RC_CURRENCY_VARIANTS) || '').trim().toUpperCase()
+    const country = String(getValue(rc, RC_COUNTRY_VARIANTS) || '').trim()
+    const region = String(getValue(rc, RC_REGION_VARIANTS) || '').trim().toUpperCase()
+    const key = `${curr}|${country}|${region}`
+    if (!rateCardData.__byTriple.has(key)) rateCardData.__byTriple.set(key, [])
+    rateCardData.__byTriple.get(key).push(rc)
+  }
 }
 
 /**
@@ -334,58 +399,26 @@ function preFilterRateCardByIliAttributes(rateCardData, ili, serviceStartDate) {
 * Then categories evaluated in CATEGORY_ORDER (charge desc match); key + subkey required when defined.
 */
 function findRateCard(ili, rateCardData, configArray) {
-  const serviceStart = getIliServiceStart(ili)
-  if (!serviceStart) return null
-  const serviceStartDate = parseDate(serviceStart)
-  if (!serviceStartDate) return null
-
   const chargeDesc = getIliChargeDesc(ili)
-  const preFiltered = preFilterRateCardByIliAttributes(rateCardData, ili, serviceStartDate)
+  ensureRateCardIndex(rateCardData)
+  const preFiltered = preFilterRateCardByIliAttributes(rateCardData, ili, null)
 
-  for (let t = 0; t < CATEGORY_ORDER.length; t++) {
-    const categoryKey = CATEGORY_ORDER[t]
-    const entries = getCategoryEntries(configArray, categoryKey)
-    if (entries.length === 0) continue
-
-    const match = matchChargeDescriptionToCategory(chargeDesc, entries)
-    if (!match) continue
-    if (match.ambiguous) continue
-
-    const meta = CATEGORY_META[categoryKey]
-    if (!meta) continue
-    const subType = meta.subType
-
-    const matchedSubkey = match.subkey
-    const matchedKey = (match.key || '').trim()
-    const candidates = preFiltered.filter(rc => {
-      const rcSub = getValue(rc, RC_SUB_TYPE_VARIANTS)
-      if (rcSub !== subType) return false
-      const rcGoodsServices = getValue(rc, RC_GOODS_SERVICES_VARIANTS)
-      if (rcGoodsServices && matchedSubkey) {
-        const goodsServicesList = rcGoodsServices.split(',').map(s => s.trim().toLowerCase())
-        const matchedLower = String(matchedSubkey).trim().toLowerCase()
-        if (!goodsServicesList.includes(matchedLower)) return false
-      }
-      if (matchedKey) {
-        const rcGS = getValue(rc, RC_GOODS_SERVICES_VARIANTS)
-        if (rcGS) {
-          const rcGSLower = rcGS.toLowerCase()
-          const keyLower = matchedKey.toLowerCase()
-          if (!rcGSLower.includes(keyLower)) return false
-        }
-      }
-      return true
-    })
- 
-    const fieldArr = match.fields || []
-    for (let c = 0; c < candidates.length; c++) {
-      const rc = candidates[c]
-      if (getValue(rc, RC_ICB_FLAG_VARIANTS).toLowerCase() === 'true') continue
-      if (!checkExactRateCardEntry(rc, chargeDesc, fieldArr)) continue
-      return { rc, subType, matchedSubkey: matchedSubkey || null, match: { keyObj: match.keyObj } }
+  // New: CD similarity match (same threshold as quote validation)
+  if (!chargeDesc) return null
+  let best = null
+  for (const rc of preFiltered) {
+    if (getValue(rc, RC_ICB_FLAG_VARIANTS).toLowerCase() === 'true') continue
+    const rcDesc = buildRateCardDesc(rc)
+    if (!rcDesc) continue
+    const { score, passes } = calculateCDSimilarity(chargeDesc, rcDesc)
+    if (!passes) continue
+    if (!best || score > best.score) {
+      best = { rc, score, rcDesc }
     }
   }
-  return null
+  if (!best) return null
+  const subType = getValue(best.rc, RC_SUB_TYPE_VARIANTS) || 'Unknown'
+  return { rc: best.rc, subType, cdScore: best.score, rcDesc: best.rcDesc }
 }
  
 /**
@@ -433,30 +466,7 @@ export function validateWithRateCard(ili, rateCardData, configArray, options = {
   const priceTolerance = options.priceTolerance != null ? options.priceTolerance : 0.05
  
   const serviceStart = getIliServiceStart(ili)
-  if (!serviceStart) {
-    return {
-      result: 'skipped',
-      remarks: 'Out-of-Scope Item. Service Start Date is missing. This Line Item will be handled manually. Validation has been skipped.'
-    }
-  }
-  const serviceStartDate = parseDate(serviceStart)
-  if (!serviceStartDate) {
-    return {
-      result: 'skipped',
-      remarks: 'Out-of-Scope Item. Service Start Date is invalid. This Line Item will be handled manually. Validation has been skipped.'
-    }
-  }
-  const effectiveWindow = getEffectiveWindowFromRateCard(rateCardData)
-  const windowFromDisplay = effectiveWindow ? effectiveWindow.fromDisplay : EFFECTIVE_FROM_FALLBACK
-  const windowTillDisplay = effectiveWindow ? effectiveWindow.tillDisplay : EFFECTIVE_TILL_FALLBACK
-  if (!isServiceStartInEffectiveWindow(serviceStart, effectiveWindow)) {
-    const interpretedDate = serviceStartDate ? serviceStartDate.toISOString().slice(0, 10) : ''
-    const dateDisplay = interpretedDate ? `${serviceStart} (${interpretedDate})` : String(serviceStart)
-    return {
-      result: 'skipped',
-      remarks: `Out-of-Scope Item. Service Start Date ${dateDisplay} does not fall within the rate card effective window (${windowFromDisplay} to ${windowTillDisplay}). This Line Item will be handled manually. Validation has been skipped.`
-    }
-  }
+  // Service start date effective-window validation intentionally skipped (user requirement).
  
   let invPrice = getNumeric(ili, ['unit_price', ' UNIT_SELLING_PRICE ', 'UNIT_SELLING_PRICE', 'unit_selling_price', 'Unit Price'])
   const lla = getNumeric(ili, ['line_level_amount', ' LINE_LEVEL_AMOUNT ', 'LINE_LEVEL_AMOUNT', 'lla', 'Line Level Amount'])
@@ -474,7 +484,7 @@ export function validateWithRateCard(ili, rateCardData, configArray, options = {
     }
   }
  
-  const { rc, subType } = found
+  const { rc, subType, rcDesc } = found
   const chargeDesc = getIliChargeDesc(ili)
   const cup = getRateCardUnitPrice(rc, subType, chargeDesc)
  
@@ -496,8 +506,14 @@ export function validateWithRateCard(ili, rateCardData, configArray, options = {
     rc_u_goods_services_category: getValue(rc, RC_GOODS_SERVICES_VARIANTS),
     rc_u_amps: getRcValue(rc, 'u_amps'),
     rc_u_volt: getRcValue(rc, 'u_volt'),
-    rc_u_icb_flag: getValue(rc, RC_ICB_FLAG_VARIANTS)
+    rc_u_icb_flag: getValue(rc, RC_ICB_FLAG_VARIANTS),
+    rc_desc: rcDesc || buildRateCardDesc(rc),
+    rc_desc_tokens: formatCDTokensForDisplay(parseSentenceCD(rcDesc || buildRateCardDesc(rc)))
   }
+
+  // If we found a matching RC line item after filters + CD matching, treat as pass.
+  // (User requirement: don't fail by price once RC match exists.)
+  return { result: 'validated', remarks: 'Rate card line item matched (filters + CD); validation passed.', ...rcFields }
 
   if (getValue(rc, RC_ICB_FLAG_VARIANTS).toLowerCase() === 'true') {
     return {

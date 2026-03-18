@@ -1,12 +1,16 @@
 import { useState, useMemo, useEffect, memo, useRef, useDeferredValue, startTransition } from 'react'
 import * as XLSX from 'xlsx'
 import { runValidation as runValidationLogic } from './validationLogic'
+import { QUOTE_VALIDATION_LOGIC_VERSION } from './validationLogic'
 import { formatDateForDisplay } from './rateCardValidation.js'
 import './ExcelValidation.css'
 
+const UI_BUILD_VERSION = `ui-${new Date().toISOString()}`
 // ── IndexedDB cache helpers ──────────────────────────────────────────────────
 const IDB_NAME = 'equinix-file-cache'
 const IDB_STORE = 'parsed-files'
+// TEMP: disable IndexedDB caching for auto-loaded files to avoid stale parses during debugging
+const DISABLE_AUTOLOAD_CACHE = true
 
 function openCacheDB() {
   return new Promise((resolve, reject) => {
@@ -117,6 +121,8 @@ const EXPORT_COLUMNS = [
   ['ili_billing_till', 'ILI Billing Till'],
   ['prorata_factor', 'Prorata Factor'],
   ['rc_u_rate_card_sub_type', 'RC Sub Type'],
+  ['rc_desc', 'RC Description (synthesized)'],
+  ['rc_desc_tokens', 'RC Desc Tokens'],
   ['rc_u_effective_from', 'RC Effective From'],
   ['rc_effective_till', 'RC Effective Till'],
   ['rc_u_country', 'RC Country'],
@@ -208,6 +214,8 @@ const ResultRow = memo(function ResultRow({ result }) {
       <td>{formatDateForDisplay(result.ili_billing_till) || '-'}</td>
       <td>{result.prorata_factor !== undefined && !isNaN(result.prorata_factor) ? Number(result.prorata_factor).toFixed(4) : '-'}</td>
       <td>{result.rc_u_rate_card_sub_type ?? '-'}</td>
+      <td className="desc-cell">{result.rc_desc ?? '-'}</td>
+      <td className="desc-cell tokens-cell">{result.rc_desc_tokens ?? '-'}</td>
       <td>{formatDateForDisplay(result.rc_u_effective_from) || '-'}</td>
       <td>{formatDateForDisplay(result.rc_effective_till) || '-'}</td>
       <td>{result.rc_u_country ?? '-'}</td>
@@ -585,6 +593,8 @@ function ValidationResults({ results }) {
                 <th>ILI Billing Till</th>
                 <th>Prorata Factor</th>
                 <th>RC Sub Type</th>
+                <th>RC Description (synthesized)</th>
+                <th>RC Desc Tokens</th>
                 <th>RC Effective From</th>
                 <th>RC Effective Till</th>
                 <th>RC Country</th>
@@ -762,10 +772,12 @@ function ExcelValidation() {
     const currentSize = head ? parseInt(head.headers.get('content-length') || '0', 10) : 0
 
     // 3. Check cache — skip full parse if file unchanged
-    const cached = await getCached(cacheKey)
-    if (cached && cached.fileName === fileName && cached.fileSize === currentSize && currentSize > 0) {
-      applyParsedData(cached.jsonData, cached.sheets, cached.selectedSheet, null, fileName, fileType, true)
-      return
+    if (!DISABLE_AUTOLOAD_CACHE) {
+      const cached = await getCached(cacheKey)
+      if (cached && cached.fileName === fileName && cached.fileSize === currentSize && currentSize > 0) {
+        applyParsedData(cached.jsonData, cached.sheets, cached.selectedSheet, null, fileName, fileType, true)
+        return
+      }
     }
 
     // 4. Cache miss or file changed — fetch and parse
@@ -775,7 +787,9 @@ function ExcelValidation() {
     const { jsonData, sheets, selectedSheet, workbook } = parseBufferToData(buffer, fileName, fileType)
 
     // 5. Store parsed result in IndexedDB (workbook is not serializable, exclude it)
-    await setCached(cacheKey, { fileName, fileSize: buffer.byteLength, jsonData, sheets, selectedSheet })
+    if (!DISABLE_AUTOLOAD_CACHE) {
+      await setCached(cacheKey, { fileName, fileSize: buffer.byteLength, jsonData, sheets, selectedSheet })
+    }
 
     applyParsedData(jsonData, sheets, selectedSheet, workbook, fileName, fileType, true)
   }
@@ -785,7 +799,8 @@ function ExcelValidation() {
       setLoading(true)
       await Promise.all([
         loadFolderFile('InvoiceFile', 'base').catch(() => {}),
-        loadFolderFile('QuoteFile', 'quote').catch(() => {})
+        loadFolderFile('QuoteFile', 'quote').catch(() => {}),
+        loadFolderFile('RateCardFile', 'ratecard').catch(() => {})
       ])
     } catch (err) {
       console.log('Auto-load skipped:', err.message)
@@ -798,7 +813,7 @@ function ExcelValidation() {
     if (!file) return
     setLoading(true)
     // Clear cache for this slot so next auto-load re-parses the new file
-    const cacheKey = fileType === 'base' ? 'auto-InvoiceFile' : fileType === 'quote' ? 'auto-QuoteFile' : null
+    const cacheKey = fileType === 'base' ? 'auto-InvoiceFile' : fileType === 'quote' ? 'auto-QuoteFile' : fileType === 'ratecard' ? 'auto-RateCardFile' : null
     if (cacheKey) deleteCached(cacheKey)
     const reader = new FileReader()
     reader.onload = (e) => {
@@ -844,7 +859,10 @@ function ExcelValidation() {
   const allFilesUploaded = baseFile && quoteFile
 
   const workerRef = useRef(null)
+  // Use worker so UI doesn't freeze during heavy validation (rate card CD matching).
+  const USE_WORKER = true
   const getWorker = () => {
+    if (!USE_WORKER) return null
     if (workerRef.current) return workerRef.current
     try {
       workerRef.current = new Worker(new URL('./validation.worker.js', import.meta.url), { type: 'module' })
@@ -917,6 +935,9 @@ function ExcelValidation() {
     <div className="excel-validation-container">
       <header className="validation-header">
         <h1>Equinix Automation</h1>
+        <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
+          UI: {UI_BUILD_VERSION} | Logic: {QUOTE_VALIDATION_LOGIC_VERSION} | Last run: {validationResults?.logicVersion || '—'}
+        </div>
         <p>Two files: Base (Invoice line items) and Quote (Quote line items). Validate by PO, IBX, product/charge, price, and quantity.</p>
       </header>
 
@@ -1024,11 +1045,20 @@ function ExcelValidation() {
           ) : (
             <div className="file-info">
               <div className="file-details">
-                <p className="file-name"><strong>{rateCardFile.name}</strong></p>
+                <p className="file-name">
+                  <strong>{rateCardFile.name}</strong>
+                  {rateCardFile.autoLoaded && <span className="auto-loaded-badge">⚡ Auto-loaded</span>}
+                </p>
                 <div className="file-stats">
                   <span className="stat-badge">📊 {rateCardFile.rowCount.toLocaleString()} rows</span>
                   <span className="stat-badge">📋 {rateCardFile.columns.length} columns</span>
                 </div>
+                {rateCardFile.columns && rateCardFile.columns.length > 0 && (
+                  <div className="column-preview">
+                    {rateCardFile.columns.slice(0, 6).map((col, idx) => <span key={idx} className="column-tag">{col}</span>)}
+                    {rateCardFile.columns.length > 6 && <span className="column-tag more">+{rateCardFile.columns.length - 6} more</span>}
+                  </div>
+                )}
               </div>
               <button onClick={() => clearFile('ratecard')} className="clear-btn">Remove</button>
             </div>
