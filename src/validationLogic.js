@@ -449,23 +449,20 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
     return { result: null, remarks: 'No QLI with matching site_id/IBX for this serial.', matchedQLI: null, validationStep: 'Quote - No match (No IBX/site_id)' }
   }
 
-  // --- Currency filter (COMMENTED OUT for now): only QLIs whose currency matches ILI CURR ---
-  // const iliCurr = getValue(ili, ['CURR', 'curr', 'currency'])
-  // const iliCurrNorm = iliCurr != null ? String(iliCurr).trim().toUpperCase() : ''
-  // let qlisForMatch = qlisByIbx
-  // if (iliCurrNorm) {
-  //   qlisForMatch = qlisByIbx.filter(qli => {
-  //     const qliCurr = getValue(qli, QLI_CURRENCY_VARIANTS)
-  //     const qliCurrNorm = qliCurr != null ? String(qliCurr).trim().toUpperCase() : ''
-  //     return qliCurrNorm === iliCurrNorm
-  //   })
-  // }
-  // if (qlisForMatch.length === 0) {
-  //   return { result: null, remarks: 'No QLI with matching currency (CURR) for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Currency)' }
-  // }
-
-  // With currency filter off: use QLIs that passed IBX for further matching
+  // --- Currency filter: only QLIs whose currency matches ILI CURR ---
+  const iliCurr = getValue(ili, ['CURR', 'curr', 'currency'])
+  const iliCurrNorm = iliCurr != null ? String(iliCurr).trim().toUpperCase() : ''
   let qlisForMatch = qlisByIbx
+  if (iliCurrNorm) {
+    qlisForMatch = qlisByIbx.filter(qli => {
+      const qliCurr = getValue(qli, QLI_CURRENCY_VARIANTS)
+      const qliCurrNorm = qliCurr != null ? String(qliCurr).trim().toUpperCase() : ''
+      return qliCurrNorm === iliCurrNorm
+    })
+  }
+  if (qlisForMatch.length === 0) {
+    return { result: null, remarks: 'No QLI with matching currency (CURR) for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Currency)' }
+  }
 
   // Quantity sign filter: positive ILI → only positive QLI; negative ILI → only negative QLI.
   if (quantity > 0) {
