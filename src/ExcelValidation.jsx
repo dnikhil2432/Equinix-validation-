@@ -400,22 +400,8 @@ function ValidationResults({ results }) {
         <div className="summary-card total">
           <div className="summary-icon">📊</div>
           <div className="summary-content">
-            <span className="summary-label">Total Lines</span>
+            <span className="summary-label">Total Invoice line items</span>
             <span className="summary-value">{results.totalLines}</span>
-          </div>
-        </div>
-        <div className="summary-card passed">
-          <div className="summary-icon">✅</div>
-          <div className="summary-content">
-            <span className="summary-label">Passed</span>
-            <span className="summary-value">{summaryCounts.passedMatch}</span>
-          </div>
-        </div>
-        <div className="summary-card failed">
-          <div className="summary-icon">❌</div>
-          <div className="summary-content">
-            <span className="summary-label">Failed</span>
-            <span className="summary-value">{summaryCounts.failedMatch}</span>
           </div>
         </div>
       </div>
@@ -647,6 +633,8 @@ function ExcelValidation() {
   const [validationProgress, setValidationProgress] = useState(0)
   const [priceTolerance, setPriceTolerance] = useState(5)
   const [qtyTolerance, setQtyTolerance] = useState(20)
+  const [useQuoteIbxFilter, setUseQuoteIbxFilter] = useState(true)
+  const [useQuoteCurrencyFilter, setUseQuoteCurrencyFilter] = useState(true)
   const deferredValidationResults = useDeferredValue(validationResults)
 
   useEffect(() => {
@@ -891,6 +879,8 @@ function ExcelValidation() {
     const options = {
       priceTolerance: priceTol,
       qtyTolerance: qtyTol,
+      useQuoteIbxFilter,
+      useQuoteCurrencyFilter,
       rateCardData: rateCardData || undefined,
       rateCardConfig: Array.isArray(config) ? config : undefined
     }
@@ -1076,6 +1066,20 @@ function ExcelValidation() {
               </label>
               <label>
                 Quantity tolerance (%): <input type="number" min="0" max="100" step="1" value={qtyTolerance} onChange={(e) => setQtyTolerance(Number(e.target.value) || 0)} />
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={useQuoteIbxFilter}
+                  onChange={(e) => setUseQuoteIbxFilter(e.target.checked)}
+                /> Apply quote IBX filter
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={useQuoteCurrencyFilter}
+                  onChange={(e) => setUseQuoteCurrencyFilter(e.target.checked)}
+                /> Apply quote currency filter
               </label>
             </div>
             <p className="tolerance-hint">E.g. 5% price tolerance: invoice unit price can be up to CUP × 1.05. 20% quantity: invoice qty can be up to quote qty × 1.20.</p>
