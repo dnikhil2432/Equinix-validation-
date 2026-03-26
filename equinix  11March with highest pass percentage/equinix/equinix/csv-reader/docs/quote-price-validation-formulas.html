@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quote Price Validation – Formulas</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      max-width: 900px;
+      margin: 2rem auto;
+      padding: 2rem;
+      background: #f8f9fa;
+      color: #1a1a1a;
+    }
+    h1 {
+      font-size: 1.75rem;
+      margin-bottom: 0.5rem;
+      color: #0d47a1;
+    }
+    .subtitle { color: #555; margin-bottom: 2rem; font-size: 1rem; }
+    section {
+      background: #fff;
+      border-radius: 8px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1.25rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+      border-left: 4px solid #1976d2;
+    }
+    section h2 {
+      font-size: 1.1rem;
+      margin: 0 0 0.75rem 0;
+      color: #1565c0;
+    }
+    .formula {
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 1.05rem;
+      background: #f5f5f5;
+      padding: 0.75rem 1rem;
+      border-radius: 6px;
+      margin: 0.4rem 0;
+      overflow-x: auto;
+      border: 1px solid #e0e0e0;
+    }
+    .formula.block { display: block; }
+    .note { font-size: 0.9rem; color: #555; margin-top: 0.5rem; }
+    ul.vars { margin: 0.4rem 0 0 1rem; padding: 0; font-size: 0.95rem; }
+    ul.vars li { margin: 0.2rem 0; }
+    .symbol { font-family: Consolas, monospace; font-weight: 600; color: #0d47a1; }
+  </style>
+</head>
+<body>
+  <h1>Quote Price Validation – All Formulas</h1>
+  <p class="subtitle">Invoice line (ILI) vs matched quote line (QLI). Invoice start date is taken from the <strong>invoice file only</strong> for CUP.</p>
+
+  <section>
+    <h2>1. Derived unit price (when missing on ILI)</h2>
+    <div class="formula block">Unit Price = LLA ÷ Quantity</div>
+    <p class="note">Used when ILI has LLA and Quantity but no Unit Price (and not both zero).</p>
+  </section>
+
+  <section>
+    <h2>2. Derived LLA (when missing on ILI)</h2>
+    <div class="formula block">LLA = Unit Price × Quantity</div>
+    <p class="note">Used when ILI has Unit Price and Quantity but LLA is empty or zero.</p>
+  </section>
+
+  <section>
+    <h2>3. Contract Unit Price (CUP) – from invoice start date only</h2>
+    <p>Uses <strong>invoice file</strong> <span class="symbol">invoice_start_date</span> (or billing_from / service_start_date).</p>
+    <p><strong>Date ranges:</strong></p>
+    <ul class="vars">
+      <li><span class="symbol">endInitial</span> = invoice_start_date + initial_term (months)</li>
+      <li><span class="symbol">endFirstTerm</span> = endInitial + term (months)</li>
+      <li><span class="symbol">numCompletedTerms</span> = floor((today − endInitial) ÷ (term × 30.44 × 24 × 60 × 60 × 1000))</li>
+    </ul>
+    <p><strong>CUP by period:</strong></p>
+    <div class="formula">today &lt; invoice_start_date  ⇒  CUP = QLI Unit Price</div>
+    <div class="formula">today &lt; endInitial  ⇒  CUP = QLI Unit Price</div>
+    <div class="formula">today &lt; endFirstTerm  ⇒  CUP = QLI Unit Price × (1 + initialTermIncrement)</div>
+    <div class="formula">today ≥ endFirstTerm  ⇒  CUP = QLI Unit Price × (1 + initialTermIncrement) × (1 + increment)<sup>numCompletedTerms</sup></div>
+    <p class="note"><span class="symbol">initialTermIncrement</span> and <span class="symbol">increment</span> from QLI (e.g. price_increase_percentage ÷ 100). <span class="symbol">initial_term</span> from ILI (first_Price_increment_applicable_after). <span class="symbol">term</span> from QLI (renewal term).</p>
+  </section>
+
+  <section>
+    <h2>4. Prorata factor (PF)</h2>
+    <div class="formula block">days = max(0, (billing_till − billing_from) ÷ (24×60×60×1000)) + 1</div>
+    <div class="formula block">daysInMonth = last day of month of billing_from</div>
+    <div class="formula block">PF = min(1, days ÷ daysInMonth)</div>
+    <p class="note">If billing_from or billing_till missing/invalid, PF = 1.</p>
+  </section>
+
+  <section>
+    <h2>5. Expected Line Level Amount (ELLA)</h2>
+    <div class="formula block">ELLA = CUP × Quantity × PF</div>
+    <p class="note">Quantity = ILI quantity. Used to validate ILI LLA against quote.</p>
+  </section>
+
+  <section>
+    <h2>6. Unit price validation</h2>
+    <div class="formula block">Pass if:  ILI Unit Price  ≤  CUP × (1 + priceTolerance)</div>
+    <p class="note">Default <span class="symbol">priceTolerance</span> = 0.05 (5%). Fail if ILI unit price exceeds this.</p>
+  </section>
+
+  <section>
+    <h2>7. LLA validation</h2>
+    <div class="formula block">Pass if:  ILI LLA  ≤  ELLA × (1 + priceTolerance)</div>
+    <p class="note">Same <span class="symbol">priceTolerance</span> as unit price (default 5%).</p>
+  </section>
+
+  <section>
+    <h2>8. Quantity validation</h2>
+    <div class="formula block">Pass if:  ILI Quantity  ≤  QLI Quantity × (1 + qtyTolerance)</div>
+    <p class="note">Default <span class="symbol">qtyTolerance</span> = 0.20 (20%).</p>
+  </section>
+
+  <section>
+    <h2>Summary – pass conditions (quote path)</h2>
+    <div class="formula">Unit Price ≤ CUP × 1.05</div>
+    <div class="formula">LLA ≤ ELLA × 1.05  &nbsp;&nbsp;  where  ELLA = CUP × Qty × PF</div>
+    <div class="formula">Quantity ≤ QLI Quantity × 1.20</div>
+  </section>
+</body>
+</html>
