@@ -1,0 +1,65 @@
+================================================================================
+QUOTE VALIDATION 
+================================================================================
+
+BEFORE QUOTE VALIDATION (per invoice line)
+--------------------------------------------------------------------------------
+• Read from invoice line (ILI): PO number, IBX, item code (PRODUCT_CODE or ITEM_NUMBER or "Item Code"), description, quantity, unit price, line-level amount (LLA), and any billing/date and term fields needed.
+• Derive if missing: If unit price is missing but LLA and quantity exist, unit price = LLA ÷ quantity. If LLA is missing but unit price and quantity exist, LLA = unit price × quantity.
+• Quote file is indexed by "Po Number" (trimmed, uppercased). Each invoice line only sees quote lines for its PO.
+
+
+1. PO FILTER (mandatory)
+--------------------------------------------------------------------------------
+• Invoice line must have a non-blank PO number (after trim).
+• If no PO: line is Skipped (Quote - No match (No PO on ILI)) and goes to rate card; no further quote checks.
+• Quote must have at least one line with that Po Number.
+• If PO not in quote: line is Skipped (Quote - No match (No PO)) and goes to rate card; no further quote checks.
+
+
+2. IBX / SITE FILTER (mandatory)
+--------------------------------------------------------------------------------
+• Invoice line must have a non-blank IBX.
+• If no IBX: line is Skipped (Quote - No match (No IBX on ILI)) and goes to rate card.
+• From the quote lines for this PO, keep only lines whose Site Id (or site_id) matches the ILI's IBX (either string contains the other, case-insensitive).
+• If none match: line is Skipped (Quote - No match (No IBX/site_id)) and goes to rate card.
+• Remaining list is "qlisByIbx" (filtered by PO and IBX).
+
+
+3. PICKING ONE QUOTE LINE (QLI) TO VALIDATE AGAINST
+--------------------------------------------------------------------------------
+
+3a. Item-code match (ILI has item code and at least one QLI matches)
+• Compare ILI item code with each QLI Item Code after normalizeText (strip non-alphanumeric, lowercase); match if one includes the other.
+• Collect all such QLIs and score each with description match count (ILI description vs QLI Item Description / Changed Item Description) for tie-break.
+• If there is at least one item-code match: pick the QLI with the highest description match count → selectedQLI. Then run price/quantity validation on that one QLI only.
+
+3b. No item-code match – charge description only when ILI has no item code
+• If the ILI has an item code but no QLI matched by item code: do not use description; no selected QLI → Skipped (Quote - No match (Item code/description)) → rate card.
+• If the ILI has no item code (empty product/item code):
+  - From qlisByIbx, keep only QLIs that also have empty Item Code.
+  - On that subset, run charge description matching: ILI description vs QLI "Item Description" and "Changed Item Description" (at least 3 words match). If needed, fallback: scan other QLI columns for a text that matches.
+  - If at least one description match: pick the QLI with the highest match count → selectedQLI. Then run price/quantity validation on that one QLI.
+  - If no description match: no selected QLI → Skipped (Quote - No match (Item code/description)) → rate card.
+
+3c. No selected QLI
+• If after 3a/3b there is still no selectedQLI, the line is Skipped (Quote - No match (Item code/description)) and goes to rate card.
+
+
+4. PRICE AND QUANTITY VALIDATION (on the single selected QLI)
+--------------------------------------------------------------------------------
+• No charge: If invoice unit price and LLA are both zero (or empty/NaN), result is Quote - Passed (No charge).
+• Current Unit Price (CUP): From QLI MRC/OTC and dates/terms (invoice date, service start, initial term, renewal term, price increase %), compute CUP. If CUP is missing or ≤ 0 → Quote - Failed (No CUP) (does not go to rate card).
+• Unit price check: Invoice unit price must be ≤ CUP × (1 + price tolerance). If not → Quote - Failed (Unit price).
+• LLA check: Invoice LLA must be ≤ ELLA × (1 + price tolerance), where ELLA uses CUP, quantity, and prorata factor. If not → Quote - Failed (LLA).
+• Quote quantity: QLI must have a valid Quantity > 0. If not → Quote - Failed (No quote quantity). If invoice quantity > QLI quantity × (1 + quantity tolerance) → Quote - Failed (Quantity).
+• If all checks pass → Quote - Passed.
+
+
+5. OUTCOMES
+--------------------------------------------------------------------------------
+• Passed: Line is "validated with quote" (Quote - Passed or Quote - Passed (No charge)).
+• Failed: Line is "validated with quote" but failed (e.g. unit price, LLA, quantity, no CUP, no quote quantity); does not go to rate card.
+• Skipped: No PO, PO not in quote, no IBX, no site match, or no item/description match → line is sent to rate card validation (if rate card data and config are provided).
+
+

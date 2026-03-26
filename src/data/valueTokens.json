@@ -1,0 +1,5 @@
+{
+  "only_positive": ["ft", "Mbps", "Gbps", "G", "M", "Core","kVA"],
+  "only_negative": [],
+  "positive_or_negitive": []
+}

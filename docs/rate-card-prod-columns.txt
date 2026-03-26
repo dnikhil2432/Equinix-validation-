@@ -1,0 +1,55 @@
+================================================================================
+RATE CARD – PROD FILE COLUMN MAPPING (x_attm_doms_rate_card_data)
+================================================================================
+
+Prod file has 30 columns. Duplicate headers (IBX x2, NTP Rate x4, PTP Rate x4)
+are made unique on load as: "IBX (2)", "NTP Rate (1)".."NTP Rate (4)", "PTP Rate (1)".."PTP Rate (4)".
+
+--------------------------------------------------------------------------------
+PROD COLUMN -> VALIDATION USE
+--------------------------------------------------------------------------------
+Goods or Services              -> u_goods_services / variant match (key + goods-services)
+Goods or Services Category     -> u_goods_services_category, variant match
+Parameter1                     -> u_parameter1, field-in-description check
+Parameter2                     -> (not used in validation; no config field)
+Minimum Cabinet Density (kVA)   -> u_minimum_cabinet_density, u_pricekva (price per kVA for some sub types)
+Rate Card Sub-Type             -> sub type filter (e.g. Interconnection)
+Rate Card Type                 -> rc_u_rate_card_type (display)
+Effective From                 -> date window: service_start >= Effective From
+Effective Till                 -> date window: service_start < Effective Till
+Order Placed Date              -> not used
+IBX / IBX (2)                  -> u_ibxs (when All IBXs = false)
+ICB Flag                       -> u_icb_flag (skip if true)
+Country                        -> u_country filter
+Region                         -> u_region filter
+Excluded IBXs                  -> u_excluded_ibxs (when All IBXs = true)
+All IBXs                       -> u_all_ibx (true = applies to all except Excluded)
+MRC Rate                       -> u_rate / u_pricekva (unit price for MRC sub types)
+NRC Rate                       -> u_nrc
+Non-Recurring Charge           -> u_nrc (alternative)
+NTP Rate (1)..(4)              -> Standard NTP (1), Enterprise NTP (3); (2),(4) available if needed
+PTP Rate (1)..(4)              -> Standard PTP (1), Enterprise PTP (3)
+Phase                          -> not used
+
+--------------------------------------------------------------------------------
+NOT IN PROD FILE (optional / display only)
+--------------------------------------------------------------------------------
+u_amps, u_volt                 -> Used in config "fields" for some categories (e.g. AC Circuit).
+                                 If your prod file has amps/volt in another column, add a variant
+                                 (e.g. "Parameter2" or a dedicated header).
+
+--------------------------------------------------------------------------------
+EFFECTIVE DATES
+--------------------------------------------------------------------------------
+Prod file stores dates as Excel serial numbers (e.g. 45748, 46112). The app
+now converts these to dates automatically (parseDate handles 1000 < n < 100000).
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+All columns required for validation are present in the prod file. Mapping is
+in place for: sub type, country, region, effective from/till, IBX/All IBXs/
+Excluded IBXs, ICB Flag, goods services, MRC Rate, NRC Rate, Parameter1,
+Minimum Cabinet Density, and NTP/PTP Rate (1)/(3). Only u_amps / u_volt have
+no prod column yet; add a variant in rateCardValidation.js if your rate card
+includes them under a different header (e.g. Parameter2).
