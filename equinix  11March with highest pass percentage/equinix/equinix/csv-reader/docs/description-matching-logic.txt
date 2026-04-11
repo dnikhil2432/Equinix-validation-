@@ -1,0 +1,102 @@
+================================================================================
+DESCRIPTION MATCHING – DETAILED EXPLANATION
+================================================================================
+There are two separate "description match" flows in the app:
+  1) Quote validation: Invoice line description vs Quote line description(s).
+  2) Rate card validation: Invoice charge description vs rate-card-types.json keys.
+
+--------------------------------------------------------------------------------
+1. QUOTE VALIDATION – DESCRIPTION MATCH (validationLogic.js)
+--------------------------------------------------------------------------------
+
+When it is used
+  - Only when the invoice line (ILI) has NO item code (empty PRODUCT_CODE/Item Code).
+  - We first filter quote lines by PO and then by IBX/site_id (qlisByIbx).
+  - From that list we only consider QLIs that also have empty Item Code.
+  - Among those, we pick one QLI by "description match". If none match by description,
+    the line goes to rate card (no quote match).
+
+Data sources
+  - ILI description: from invoice column DESCRIPTION (e.g. "Cross Connect- POTS  -- -Prorated Recurring Charge-01-DEC-2025").
+  - QLI descriptions: from quote columns "Item Description" and "Changed Item Description"
+    (e.g. "Network Cable Connection - POTS - Campus - Z-side IBX- DA 6 S/N:").
+  - Both QLI fields are scored; best score wins.
+
+Algorithm (CD Validation: tokens.json + valueTokens.json)
+  1) parseSentence(desc) from cdValidationParser.js:
+     - Key phrases: one regex from tokens.json (longest first) → "contains".
+     - Value tokens: number + unit from valueTokens.json (e.g. "10 Gbps", "55 kVA") → "value_matches".
+     - Dates and UUIDs stripped into special_matches; remainder → not_contains.
+  2) For ILI and QLI: A = parseSentence(iliDesc), B = parseSentence(qliDesc).
+  3) Overall similarity = (Jaccard(A.contains, B.contains) + Jaccard(A.value_matches, B.value_matches)) / 2.
+     Jaccard returns 100 when both sets are empty.
+  4) Pass if score >= 80. matchCount = score. ILI/QLI Desc Tokens in UI = contains + value_matches from parser.
+
+Tie-break / selection
+  - When multiple QLIs pass, we pick the one with the highest matchCount.
+
+Fallback when QLI has no description columns
+  - getPossibleDescValuesFromRow(qli) returns other string values from the row; we run
+    the same descriptionMatchScore against each and use the best if it passes.
+
+Summary (quote)
+  - CD Validation: tokens.json (key phrases) + valueTokens.json (value units). parseSentence → contains + value_matches;
+    similarity = average of Jaccard(contains) and Jaccard(value_matches); pass if >= 80.
+  - Both "Item Description" and "Changed Item Description" are considered; best score wins.
+  - Used only when ILI has no item code and only among QLIs with empty Item Code.
+  - Token files: src/data/tokens.json, src/data/valueTokens.json (from CD Validation repo).
+
+--------------------------------------------------------------------------------
+2. RATE CARD VALIDATION – CHARGE DESCRIPTION MATCH (rateCardValidation.js)
+--------------------------------------------------------------------------------
+
+When it is used
+  - To decide which rate card category (and which row) applies to an invoice line.
+  - The invoice "charge description" is read from DESCRIPTION (or description,
+    charge_description, CHARGE_DESCRIPTION). That string is matched against
+    rate-card-types.json.
+
+Data source
+  - Config: public/rate-card-types.json. Structure is an array of objects, each
+    with one key per category (e.g. "space_and_power", "interconnection"). The
+    value is an array of entries: { key, subkey?, fields? }.
+  - Example entry: { "key": "Metro Connect", "subkey": ["Protected", "Unprotected", "Dual Diverse"], "fields": ["u_parameter1"] }.
+
+Matching (matchChargeDescriptionToCategory)
+  - The invoice charge description is lowercased (no word-splitting; full string).
+  - For each entry in the category:
+      1) Key match: the entry’s "key" (e.g. "Metro Connect") is lowercased. We check
+         if the charge description CONTAINS that key (descLower.indexOf(keyLower) !== -1).
+         So it is a case-insensitive substring match on the full description.
+      2) Subkey (if present): the entry may have "subkey": [ "Protected", "Unprotected", ... ].
+         - If subkey array is empty or missing: key match is enough; we return that entry.
+         - If subkey is non-empty: we require the description to contain AT LEAST ONE
+           of the subkey strings (same substring check, case-insensitive). If the key
+           matches but no subkey is found in the description, we return { ambiguous: true }
+           and do not validate (ambiguous case).
+         - If key matches and at least one subkey is found, we return the entry plus
+           which subkey matched (used later to filter rate card rows by u_goods_services).
+  - First matching entry in the list wins (order in JSON matters).
+
+Field-based check (checkExactRateCardEntry)
+  - Some entries have "fields": [ "u_parameter1", "u_minimum_cabinet_density" ].
+  - After we find a matching key (+ subkey), we only accept a rate card row if the
+    charge description contains the value of each of those fields from that row.
+  - Example: if the config says fields: ["u_parameter1"], we read the rate card
+    row’s Parameter1 (e.g. "10G"); the invoice description must contain "10G"
+    (case-insensitive substring).
+
+Summary (rate card)
+  - Substring match: the full charge description string is not split into words.
+  - We look for the config "key" (and if present, one of the "subkeys") as
+    substrings in the description. No minimum word count.
+  - Optional "fields" require the description to contain each rate card field
+    value for the chosen row.
+
+--------------------------------------------------------------------------------
+3. QUICK COMPARISON
+--------------------------------------------------------------------------------
+  - Quote description match: CD Validation (tokens.json + valueTokens.json); Jaccard on contains and value_matches; pass if ≥80.
+  - Rate card description match: substring-based (key + optional subkey + optional
+    fields) on the full string; used to select category and rate card row.
+================================================================================
