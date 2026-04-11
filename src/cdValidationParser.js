@@ -119,6 +119,10 @@ function buildValueRegex(tokenList, numberPattern) {
 const positiveValueRegex = buildValueRegex(valueTokens.only_positive, positiveNumber)
 const negativeValueRegex = buildValueRegex(valueTokens.only_negative, negativeNumber)
 const anyValueRegex      = buildValueRegex(valueTokens.positive_or_negitive || [], anyNumber)
+
+// Avoid treating sequence separators like "-TR -TR -1 Gbps" as negative bandwidth.
+// In these cases, "-1" is a delimiter artifact, not a true negative numeric value.
+const trPrefixedBandwidthRegex = /((?:-\s*TR\d*\b\s*)+)-\s*(\d+(?:\.\d+)?)\s*(ft|Mbps|Gbps|G|M|Core|kVA)\b/gi
  
 // ─── Date / UUID regexes ─────────────────────────────────────────────────────
 const dateRangeRegex  = /\b(\d{2}-[A-Z]{3}-\d{4}\s*-\s*\d{2}-[A-Z]{3}-\d{4}|\d{2}-\d{2}-\d{4}\s*(?:-|to)\s*\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}\s*(?:-|to)\s*\d{4}-\d{2}-\d{2})\b/g
@@ -158,6 +162,17 @@ export function parseSentence(sentence) {
   }
  
   let remaining = String(sentence)
+
+  // User-approved alias: treat "Network Cable Connection" as "Cross Connect" for CD matching.
+  remaining = remaining.replace(/\bNetwork Cable Connection\b/gi, 'Cross Connect')
+
+  // User-approved aliases: Local / Remote → same as plain "Equinix Fabric Virtual Connection" for CD matching.
+  remaining = remaining.replace(/\bEquinix Fabric Local Virtual Connection\b/gi, 'Equinix Fabric Virtual Connection')
+  remaining = remaining.replace(/\bEquinix Fabric Remote Virtual Connection\b/gi, 'Equinix Fabric Virtual Connection')
+
+  // Normalize TR-separated bandwidth text before numeric extraction.
+  // Example: "-TR -TR -1 Gbps" -> "-TR -TR 1 Gbps"
+  remaining = remaining.replace(trPrefixedBandwidthRegex, (_, trPrefix, value, unit) => `${trPrefix}${value} ${unit}`)
  
   // ── Step 1: N-level hierarchical matching ─────────────────────────────────
   const level_matches = findLevelMatches(remaining, tokens)
@@ -259,7 +274,7 @@ function levelMatchScore(levelMatchesA, levelMatchesB, vmA, vmB) {
   const maxLen = Math.max(levelMatchesA.length, levelMatchesB.length)
   if (maxLen === 0) return 100
  
-  const baseWeights = [0.40, 0.35, 0.15]
+  const baseWeights = [0.60, 0.20, 0.20]
   const extraLevels = Math.max(0, maxLen - baseWeights.length)
   const extraWeight = extraLevels > 0 ? 0.10 / extraLevels : 0
  
@@ -296,32 +311,43 @@ function levelMatchScore(levelMatchesA, levelMatchesB, vmA, vmB) {
 }
  
 /**
+ * Normalize anchored value strings so "200 mbps" and "1 - 200 mbps" compare equal (invoice vs quote formatting).
+ */
+function canonicalAnchoredValue(v) {
+  const t = String(v ?? '').trim().toLowerCase()
+  if (!t) return t
+  const matches = [...t.matchAll(/(\d+(?:\.\d+)?)\s*(ft|mbps|gbps|g\b|m\b|core|kva)\b/gi)]
+  if (matches.length === 0) return t
+  const last = matches[matches.length - 1]
+  return `${last[1]} ${last[2].toLowerCase()}`
+}
+
+/**
 * Key-anchored value comparison.
 * Absent key rule: if one side has no values for a key → success.
-* Hard fail: both sides have values for same key but none agree → hardFail = true.
+* Values are compared after canonicalization (bandwidth, etc.); no global hard-fail — low anchored score is enough penalty.
 */
 function compareAnchoredValues(avmA, avmB) {
   if (avmA.length === 0 && avmB.length === 0) return { score: 100, hardFail: false }
   if (avmA.length === 0 || avmB.length === 0) return { score: 100, hardFail: false }
- 
+
   const groupA = {}
   for (const { key, value } of avmA) {
     const k = key ?? '__none__'
     if (!groupA[k]) groupA[k] = new Set()
-    groupA[k].add(value)
+    groupA[k].add(canonicalAnchoredValue(value))
   }
   const groupB = {}
   for (const { key, value } of avmB) {
     const k = key ?? '__none__'
     if (!groupB[k]) groupB[k] = new Set()
-    groupB[k].add(value)
+    groupB[k].add(canonicalAnchoredValue(value))
   }
- 
+
   const allKeys = new Set([...Object.keys(groupA), ...Object.keys(groupB)])
   let score = 0
-  let hardFail = false
   const total = allKeys.size
- 
+
   for (const key of allKeys) {
     const valsA = groupA[key]
     const valsB = groupB[key]
@@ -331,14 +357,13 @@ function compareAnchoredValues(avmA, avmB) {
       score++
     } else {
       const jaccard = calculateJaccardSimilarity([...valsA], [...valsB])
-      if (jaccard === 0) hardFail = true
       score += jaccard / 100
     }
   }
- 
+
   return {
     score: Number((score / total * 100).toFixed(2)),
-    hardFail
+    hardFail: false
   }
 }
  
@@ -346,30 +371,26 @@ const CD_PASS_THRESHOLD = 60
  
 /**
 * N-level hierarchical CD similarity.
-* Final score = 85% × levelMatchScore + 15% × anchoredValueScore.
+* Final score = 70% × levelMatchScore + 30% × anchoredValueScore.
 * Returns { score, passes, parsedA, parsedB }.
 */
 export function calculateCDSimilarity(iliDesc, qliDesc) {
   const parsedA = parseSentence(iliDesc)
   const parsedB = parseSentence(qliDesc)
- 
+
   const sLevels = levelMatchScore(
     parsedA.level_matches, parsedB.level_matches,
     parsedA.value_matches, parsedB.value_matches
   )
- 
-  const { score: sValues, hardFail } = compareAnchoredValues(
+
+  const { score: sValues } = compareAnchoredValues(
     parsedA.anchored_value_matches,
     parsedB.anchored_value_matches
   )
- 
-  if (hardFail) {
-    return { score: 0, passes: false, parsedA, parsedB }
-  }
- 
-  const score  = Number((0.85 * sLevels + 0.15 * sValues).toFixed(2))
+
+  const score  = Number((0.70 * sLevels + 0.30 * sValues).toFixed(2))
   const passes = score > CD_PASS_THRESHOLD
- 
+
   return { score, passes, parsedA, parsedB }
 }
  

@@ -1,3 +1,9 @@
+# Temp / Office lock files
+~$*
+
+# Cursor / IDE
+.cursor/
+
 # Logs
 logs
 *.log

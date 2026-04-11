@@ -130,10 +130,21 @@ function formatCDTokensForDisplay(parsed) {
   return parts.join(' | ')
 }
  
+function normalizeCDMatchingText(s) {
+  const t = String(s ?? '').trim()
+  if (!t) return ''
+  // Treat these as the same for CD matching (customer wording varies):
+  // Local / plain / Remote → canonical "Equinix Fabric Virtual Connection"
+  let out = t
+  out = out.replace(/\bequinix\s+fabric\s+local\s+virtual\s+connection\b/gi, 'Equinix Fabric Virtual Connection')
+  out = out.replace(/\bequinix\s+fabric\s+remote\s+virtual\s+connection\b/gi, 'Equinix Fabric Virtual Connection')
+  return out
+}
+ 
 function descriptionMatchScore(iliDesc, qliDesc) {
   if (!qliDesc || String(qliDesc).trim().length < 2) return { passes: false, matchCount: 0 }
-  const s1 = String(iliDesc ?? '').trim()
-  const s2 = String(qliDesc ?? '').trim()
+  const s1 = normalizeCDMatchingText(iliDesc)
+  const s2 = normalizeCDMatchingText(qliDesc)
   if (!s1 || !s2) return { passes: false, matchCount: 0 }
   const { score, passes } = calculateCDSimilarity(s1, s2)
   return { passes, matchCount: score }
@@ -180,6 +191,69 @@ function getDescMatchScore(iliDesc, qliChargeDesc, qliChangeDesc) {
 }
 
 /**
+ * Best CD score for one QLI vs ILI description; tracks which QLI text produced the winning score (for tokens display).
+ */
+function getBestCdScoreForQli(iliDesc, qli) {
+  const qliChargeDesc = getQLIChargeDesc(qli)
+  const qliChangeDesc = getQLIChangeDesc(qli)
+  let bestMatchCount = 0
+  let bestPasses = false
+  let bestDesc = ''
+  function consider(desc) {
+    if (!desc) return
+    const { passes, matchCount } = descriptionMatchScore(iliDesc, desc)
+    if (matchCount > bestMatchCount || (matchCount === bestMatchCount && passes && !bestPasses)) {
+      bestMatchCount = matchCount
+      bestPasses = passes
+      bestDesc = desc
+    }
+  }
+  consider(qliChargeDesc)
+  consider(qliChangeDesc)
+  if (iliDesc && !qliChargeDesc && !qliChangeDesc) {
+    for (const candidate of getPossibleDescValuesFromRow(qli)) {
+      consider(candidate)
+    }
+  }
+  return { matchCount: bestMatchCount, passes: bestPasses, qliDescForTokens: bestDesc }
+}
+
+function findBestCdMatchAmongQlis(chargeDesc, qlisForMatch) {
+  let bestQli = null
+  let bestScore = -1
+  let bestDescForTokens = ''
+  for (const qli of qlisForMatch || []) {
+    const r = getBestCdScoreForQli(chargeDesc, qli)
+    if (r.matchCount > bestScore) {
+      bestScore = r.matchCount
+      bestQli = qli
+      bestDescForTokens = r.qliDescForTokens || getQLIChargeDesc(qli) || getQLIChangeDesc(qli) || ''
+    }
+  }
+  if (!bestQli) return null
+  return { qli: bestQli, matchCount: bestScore, qliDescForTokens: bestDescForTokens }
+}
+
+function findBestCdMatchAmongItemCodeQlis(chargeDesc, qlisForMatch, iliItemCodeNorm) {
+  let bestQli = null
+  let bestScore = -1
+  let bestDescForTokens = ''
+  for (const qli of qlisForMatch || []) {
+    const qliCodeNorm = normalizeText(getQLIProductCode(qli))
+    if (!qliCodeNorm) continue
+    if (!qliCodeNorm.includes(iliItemCodeNorm) && !iliItemCodeNorm.includes(qliCodeNorm)) continue
+    const r = getBestCdScoreForQli(chargeDesc, qli)
+    if (r.matchCount > bestScore) {
+      bestScore = r.matchCount
+      bestQli = qli
+      bestDescForTokens = r.qliDescForTokens || getQLIChargeDesc(qli) || getQLIChangeDesc(qli) || ''
+    }
+  }
+  if (!bestQli) return null
+  return { qli: bestQli, matchCount: bestScore, qliDescForTokens: bestDescForTokens }
+}
+
+/**
  * Current Unit Price (CUP) of QLI based on date rules.
  * Uses invoice_date from the base/invoice file (ILI) as the reference date; invoice start from ILI; initialTermMonths from ILI; initialTermIncrement from QLI.
  * If invoice_date < invoice_start_date: use Unit Price (assumption: same as initial).
@@ -217,7 +291,7 @@ function getCUP(quoteItem, ili) {
 
   const initialTermMonths = initialTermMonthsRaw > 0 ? initialTermMonthsRaw : 12
   const renewalTermMonths = renewalTermMonthsRaw > 0 ? renewalTermMonthsRaw : 12
-  const incrementRate = (incrementPctRaw || 0) / 100
+  const incrementRate = (incrementPctRaw || 3) / 100
 
   let result
 
@@ -369,7 +443,23 @@ function setQuoteSkipReason(baseResult, validationStep, remarks) {
   const rem = remarks != null ? String(remarks).trim() : ''
   if (!step && !rem) return
   baseResult.quote_skip_stage = step || 'Quote - No match'
-  baseResult.quote_skip_reason = rem ? `${step || 'Quote skipped'}\n${rem}` : step
+  // Stage is in quote_skip_stage; keep reason text clean (no duplicate step line).
+  baseResult.quote_skip_reason = rem || step
+}
+
+/** When quote validation is skipped, split detail into item-code vs description columns for UI/export. */
+function applyQuoteSkipSplitColumns(baseResult) {
+  baseResult.quote_skip_item_code_remark = ''
+  baseResult.quote_skip_description_remark = ''
+  if ((baseResult.validation_result || '') !== 'Skipped') return
+  const step = baseResult.validation_step || ''
+  const rem = (baseResult.remarks || '').trim()
+  if (!rem) return
+  if (step.includes('Quote - No match (Item code)')) {
+    baseResult.quote_skip_item_code_remark = rem
+  } else if (step.includes('Quote - No match (Description)')) {
+    baseResult.quote_skip_description_remark = rem
+  }
 }
 
 export function indexQuotesByPO(quoteData) {
@@ -392,7 +482,8 @@ export function indexQuotesByPO(quoteData) {
 /**
  * Single ILI validation against a list of QLIs (already filtered by Serial number in caller).
  * IBX filter applied (currency filter commented out); then description match only (no item code). Unit price/LLA/qty validation.
- * Returns { result, remarks, matchedQLI, validationStep }.
+ * Returns { result, remarks, matchedQLI, validationStep, bestCdMatch? }.
+ * bestCdMatch: when CD is below threshold, { qli, matchCount, qliDescForTokens } for the best-scoring QLI (for UI).
  * result: 'validated' | 'failed' | null (send to rate card validation)
  */
 export function validateILIAgainstQLIs(ili, qlis, options) {
@@ -400,12 +491,13 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
     priceTolerance = 0.05,
     qtyTolerance = 0.20,
     useQuoteIbxFilter = true,
-    useQuoteCurrencyFilter = true,
     today = new Date()
   } = options || {}
 
   const ibx = getValue(ili, "IBX") || ''
   const chargeDesc = getValue(ili, "DESCRIPTION") || ''
+  const iliCurr = getValue(ili, ['CURR', 'curr', 'currency'])
+  const iliCurrNorm = iliCurr ? String(iliCurr).trim().toUpperCase() : ''
   let quantity = getNumeric(ili, ILI_QUANTITY_VARIANTS)
   let unitPrice = getNumeric(ili, ILI_UNIT_PRICE_VARIANTS)
   let lla = getNumeric(ili, ILI_LLA_VARIANTS)
@@ -455,45 +547,58 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
   }
 
   let qlisForMatch = qlisByIbx
-  // Optional currency filter (UI toggle): only QLIs whose currency matches ILI CURR.
-  if (useQuoteCurrencyFilter) {
-    const iliCurr = getValue(ili, ['CURR', 'curr', 'currency'])
-    const iliCurrNorm = iliCurr != null ? String(iliCurr).trim().toUpperCase() : ''
-    if (iliCurrNorm) {
-      qlisForMatch = qlisByIbx.filter(qli => {
-        const qliCurr = getValue(qli, QLI_CURRENCY_VARIANTS)
-        const qliCurrNorm = qliCurr != null ? String(qliCurr).trim().toUpperCase() : ''
-        return qliCurrNorm === iliCurrNorm
-      })
-    }
-    if (qlisForMatch.length === 0) {
-      return { result: null, remarks: 'No QLI with matching currency (CURR) for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Currency)' }
-    }
-  }
+
+  const iliChargeTypeRaw = getValue(ili, ['CHARGE_TYPE', 'charge_type'])
+  const iliChargeTypeNorm = iliChargeTypeRaw ? String(iliChargeTypeRaw).trim().toUpperCase() : ''
+  const isResellerDiscountLine = iliChargeTypeNorm === 'RESELLER DISCOUNT'
+  // RC CREDIT: validate like RC (recurring QLIs); skip ILI↔QLI quantity sign filter.
+  const isRcCreditLine = iliChargeTypeNorm === 'RC CREDIT'
+
+  // Reseller discount mode:
+  // Only apply this rule when CHARGE_TYPE is exactly "Reseller Discount" (RC credits can also be negative).
+  // If the ILI is a reseller discount and there is no negative-quantity QLI, validate the discount against a matched positive RC/MRC QLI.
+  let resellerDiscountMode = false
 
   // Quantity sign filter: positive ILI → only positive QLI; negative ILI → only negative QLI.
-  if (quantity > 0) {
-    qlisForMatch = qlisForMatch.filter(qli => {
-      const q = getQLIQuantity(qli)
-      return !isNaN(q) && q > 0
-    })
-    if (qlisForMatch.length === 0) {
-      return { result: null, remarks: 'ILI quantity is positive; no QLI with positive quantity for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Quantity sign)' }
-    }
-  } else if (quantity < 0) {
-    qlisForMatch = qlisForMatch.filter(qli => {
-      const q = getQLIQuantity(qli)
-      return !isNaN(q) && q < 0
-    })
-    if (qlisForMatch.length === 0) {
-      return { result: null, remarks: 'ILI quantity is negative; no QLI with negative quantity for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Quantity sign)' }
+  // Skipped for RC CREDIT (match/validate like RC without requiring matching qty sign).
+  if (!isRcCreditLine) {
+    if (quantity > 0) {
+      qlisForMatch = qlisForMatch.filter(qli => {
+        const q = getQLIQuantity(qli)
+        return !isNaN(q) && q > 0
+      })
+      if (qlisForMatch.length === 0) {
+        return { result: null, remarks: 'ILI quantity is positive; no QLI with positive quantity for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Quantity sign)' }
+      }
+    } else if (quantity < 0) {
+      const negQlis = qlisForMatch.filter(qli => {
+        const q = getQLIQuantity(qli)
+        return !isNaN(q) && q < 0
+      })
+      if (negQlis.length === 0) {
+        if (isResellerDiscountLine) {
+          // No negative QLI exists; attempt reseller-discount validation against positive QLIs.
+          resellerDiscountMode = true
+          qlisForMatch = qlisForMatch.filter(qli => {
+            const q = getQLIQuantity(qli)
+            return !isNaN(q) && q > 0
+          })
+          if (qlisForMatch.length === 0) {
+            return { result: null, remarks: 'Reseller Discount line: no QLI with negative quantity and no positive QLI to validate discount against.', matchedQLI: null, validationStep: 'Quote - No match (Quantity sign)' }
+          }
+        } else {
+          return { result: null, remarks: 'ILI quantity is negative; no QLI with negative quantity for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Quantity sign)' }
+        }
+      } else {
+        qlisForMatch = negQlis
+      }
     }
   }
 
   // Charge type preference: RC/MRC ILIs prefer MRC QLIs; NRC/OTC ILIs prefer NRC/OTC QLIs.
-  const iliChargeType = getValue(ili, ['CHARGE_TYPE', 'charge_type']).toUpperCase()
+  const iliChargeType = iliChargeTypeNorm
   if (iliChargeType) {
-    const iliIsRecurring = iliChargeType === 'RC' || iliChargeType === 'MRC'
+    const iliIsRecurring = iliChargeType === 'RC' || iliChargeType === 'MRC' || iliChargeType === 'RC CREDIT'
     const iliIsNonRecurring = iliChargeType === 'NRC' || iliChargeType === 'OTC'
     if (iliIsRecurring || iliIsNonRecurring) {
       const ctFiltered = qlisForMatch.filter(qli => {
@@ -513,12 +618,14 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
 
   // 3a. Item-code match (ILI has item code): require BOTH item-code match AND description ≥ 60%
   if (iliItemCodeNorm) {
+    let anyItemCodeMatch = false
     const itemCodeCandidates = []
     for (const qli of qlisForMatch) {
       const qliCodeRaw = getQLIProductCode(qli)
       const qliCodeNorm = normalizeText(qliCodeRaw)
       if (!qliCodeNorm) continue
       if (!qliCodeNorm.includes(iliItemCodeNorm) && !iliItemCodeNorm.includes(qliCodeNorm)) continue
+      anyItemCodeMatch = true
       const qliChargeDesc = getQLIChargeDesc(qli)
       const qliChangeDesc = getQLIChangeDesc(qli)
       let descScore = getDescMatchScore(chargeDesc, qliChargeDesc, qliChangeDesc)
@@ -551,9 +658,19 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
           if (candVal < bestVal) best = cand
         }
       }
-      return validateWithQLI(best.qli)
+      return validateWithCurrencyRemark(best.qli)
     }
-    return { result: null, remarks: 'No QLI matched by item code with description ≥ 60% for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Item code/description)' }
+    if (!anyItemCodeMatch) {
+      return { result: null, remarks: 'No quote line with a matching item code for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Item code)' }
+    }
+    const bestCdItemCode = findBestCdMatchAmongItemCodeQlis(chargeDesc, qlisForMatch, iliItemCodeNorm)
+    return {
+      result: null,
+      remarks: 'Item code matched, but charge description similarity was below 60% for every candidate.',
+      matchedQLI: null,
+      validationStep: 'Quote - No match (Description)',
+      bestCdMatch: bestCdItemCode
+    }
   }
 
   // 3b. ILI has no item code – description-only, but only against QLIs that also have empty item code
@@ -562,7 +679,7 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
     return !qliCodeNorm
   })
   if (qlisForMatch.length === 0) {
-    return { result: null, remarks: 'ILI has no item code and no QLI with empty item code for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Item code/description)' }
+    return { result: null, remarks: 'ILI has no item code; no quote line with empty item code for this serial/IBX.', matchedQLI: null, validationStep: 'Quote - No match (Item code)' }
   }
 
   // --- Description match (no item code, or both sides empty item code): pick best QLI by CD similarity > 60% ---
@@ -606,11 +723,19 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
   }
 
   if (!selectedQLI) {
-    return { result: null, remarks: 'No QLI matched by description (CD similarity > 60% required).', matchedQLI: null, validationStep: 'Quote - No match (Description)' }
+    const bestCdNoItemCode = findBestCdMatchAmongQlis(chargeDesc, qlisForMatch)
+    return {
+      result: null,
+      remarks: 'No quote line reached 60% charge description similarity (CD match).',
+      matchedQLI: null,
+      validationStep: 'Quote - No match (Description)',
+      bestCdMatch: bestCdNoItemCode
+    }
   }
 
   // Run price/LLA/quantity validation for one QLI; returns result object.
   function validateWithQLI(qli) {
+
     if (unitPrice === 0 && lla === 0 || unitPrice === '' && lla === '') {
       return { result: 'validated', remarks: 'Unit Price and LLA are zero; no charge.', matchedQLI: qli, validationStep: 'Quote - Passed (No charge)', effectiveLla: 0, llaCalculated, ella: NaN, cup: NaN, fallbackUnitPrice: NaN, fallbackUnitPriceSource: null }
     }
@@ -632,16 +757,205 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
       }
     }
 
+    const fallbackNote = fallbackUnitPriceSource ? ` (QLI unit price derived from ${fallbackUnitPriceSource} / Quantity)` : ''
+
+    // QLI recurring PF: derived from dates embedded in QLI description.
+    // This is applied to the QLI/CUP basis (effectiveCup) before unit price validation (and also LLA/ELLA since ella uses effectiveCup).
+    // Expected patterns in QLI description:
+    //  - "...-Prorated Recurring Charge-20-APR-2022-30-APR-2022..."
+    //  - "...-Prorated Recurring Charge-20-APR-2022..." (then recurringTo = last day of recurringFrom month)
+    const parseDdMmmYyyyUTC = (s) => {
+      const m = /^(\d{1,2})-([A-Z]{3})-(\d{4})$/i.exec(String(s || '').trim())
+      if (!m) return null
+      const day = Number(m[1])
+      const mon = String(m[2]).toUpperCase()
+      const year = Number(m[3])
+      const monthMap = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 }
+      const monthIdx = monthMap[mon]
+      if (monthIdx === undefined || !Number.isFinite(day) || !Number.isFinite(year)) return null
+      return new Date(Date.UTC(year, monthIdx, day))
+    }
+    const computePFQLI = (qliDesc) => {
+      const desc = String(qliDesc || '')
+      const m = /Prorated\s+Recurring\s+Charge-\s*([0-9]{1,2}-[A-Z]{3}-[0-9]{4})(?:\s*-\s*([0-9]{1,2}-[A-Z]{3}-[0-9]{4}))?/i.exec(desc)
+      if (!m) return 1
+      const fromD = parseDdMmmYyyyUTC(m[1])
+      if (!fromD) return 1
+      const fromYear = fromD.getUTCFullYear()
+      const fromMonth = fromD.getUTCMonth()
+      const daysInMonth = new Date(Date.UTC(fromYear, fromMonth + 1, 0)).getUTCDate()
+      const toD = m[2] ? parseDdMmmYyyyUTC(m[2]) : new Date(Date.UTC(fromYear, fromMonth + 1, 0))
+      if (!toD) return 1
+      const msPerDay = 24 * 60 * 60 * 1000
+      const daysInRange = Math.max(0, (toD.getTime() - fromD.getTime()) / msPerDay) + 1 // inclusive
+      return Math.min(1, daysInRange / daysInMonth)
+    }
+
+    const qliDescForPf = getQLIChargeDesc(qli)
+    const pfQLI = computePFQLI(qliDescForPf)
+    const normFactorQLI = pfQLI > 0 && pfQLI < 1 ? 1 / pfQLI : 1
+    effectiveCup = effectiveCup * normFactorQLI
+
+    // Reseller discount validation: negative ILI is a discount line.
+    // Validate ILI unit price as 15% of the matched positive RC/MRC QLI unit price (effectiveCup),
+    // using the same PF normalization for ILI (unitPriceForCompare) and QLI (effectiveCup).
+    if (resellerDiscountMode) {
+      const qliQtyReseller = getQLIQuantity(qli)
+      if (isNaN(qliQtyReseller) || qliQtyReseller === 0) {
+        return {
+          result: 'failed',
+          remarks: `Reseller Discount: matched QLI has no quantity; cannot validate 15% discount / extended path.${fallbackNote}`,
+          matchedQLI: qli,
+          validationStep: 'Quote - Failed (Reseller discount - no QLI qty)',
+          effectiveLla: lla,
+          llaCalculated,
+          ella: NaN,
+          cup: effectiveCup,
+          fallbackUnitPrice,
+          fallbackUnitPriceSource,
+          effectiveCup
+        }
+      }
+      const pf = getPF(ili)
+      const normFactor = pf > 0 && pf < 1 ? 1 / pf : 1
+      const unitPriceForCompare = normFactor === 1 ? unitPrice : (isNaN(unitPrice) ? unitPrice : unitPrice * normFactor)
+      const unitPriceMissingOrInvalid = (isNaN(unitPriceForCompare) || unitPriceForCompare == null)
+      if (unitPriceMissingOrInvalid) {
+        return {
+          result: 'failed',
+          remarks: `Reseller Discount validation (15% of RC unit price).${fallbackNote}\nCannot validate: ILI unit price missing or invalid.`,
+          matchedQLI: qli,
+          validationStep: 'Quote - Failed (Reseller discount 15% RC)',
+          effectiveLla: lla,
+          llaCalculated,
+          ella: NaN,
+          cup: effectiveCup,
+          fallbackUnitPrice,
+          fallbackUnitPriceSource,
+          unitPriceForCompare,
+          effectiveCup
+        }
+      }
+
+      const expectedDiscountUnitPrice = Math.abs(effectiveCup) * 0.15
+      const actualDiscountUnitPrice = Math.abs(unitPriceForCompare)
+
+      // Your rule: pass as long as discount does not exceed 15%*(1+priceTolerance) (cap check).
+      const capAmt = Math.max(1, expectedDiscountUnitPrice * (1 + priceTolerance))
+      const withinCap = actualDiscountUnitPrice <= capAmt
+
+      // Soft-check (remark only): is it actually close to 15% (symmetric tolerance)?
+      const closenessTol = Math.max(1, expectedDiscountUnitPrice * priceTolerance)
+      const isCloseTo15 = Math.abs(actualDiscountUnitPrice - expectedDiscountUnitPrice) <= closenessTol
+
+      const remarks = [
+        `Reseller Discount validation (15% of RC unit price).${fallbackNote}`,
+        `RC unit price used (effective CUP): ${Math.abs(effectiveCup).toFixed(2)}`,
+        `Expected 15% discount unit price: ${expectedDiscountUnitPrice.toFixed(2)} (closeness ±${closenessTol.toFixed(2)})`,
+        `Max allowed discount unit price (cap): ${capAmt.toFixed(2)} (15%*(1+tol))`,
+        `Actual ILI unit price (normalized): ${actualDiscountUnitPrice.toFixed(2)}`,
+        isCloseTo15 ? 'Discount is ~15% (within closeness tolerance).' : 'Note: discount is not ~15% (passed because it is within the max allowed cap).'
+      ].join('\n')
+
+      return withinCap
+        ? {
+            result: 'validated',
+            remarks,
+            matchedQLI: qli,
+            validationStep: 'Quote - Passed (Reseller discount 15% RC)',
+            effectiveLla: lla,
+            llaCalculated,
+            ella: NaN,
+            cup: effectiveCup,
+            fallbackUnitPrice,
+            fallbackUnitPriceSource,
+            unitPriceForCompare,
+            effectiveCup
+          }
+        : (() => {
+            // Fallback (mirrors the non-reseller "qty==1 escape hatch"):
+            // If |ILI qty| == 1, validate by LLA using discount extended amount instead of unit price.
+            const iliQtyAbs = Math.abs(quantity)
+            const llaAbs = Math.abs(lla)
+            const qliQtyRaw = getQLIQuantity(qli)
+            const qliQtyAbs = Math.abs(qliQtyRaw)
+            const canTryLlaFallback =
+              iliQtyAbs === 1 &&
+              !isNaN(llaAbs) &&
+              llaAbs !== 0 &&
+              !isNaN(qliQtyAbs) &&
+              qliQtyAbs !== 0
+
+            if (canTryLlaFallback) {
+              // expected discount extended for the invoice period
+              const expectedDiscountExtended = expectedDiscountUnitPrice * qliQtyAbs * pf
+              const capExtended = Math.max(1, expectedDiscountExtended * (1 + priceTolerance))
+              const passesByLla = llaAbs <= capExtended
+              const llaRemark = [
+                remarks,
+                'Unit-price cap check failed; tried LLA fallback (|ILI qty|=1).',
+                `Expected discount extended: ${expectedDiscountExtended.toFixed(2)} (cap ${capExtended.toFixed(2)})`,
+                `Actual |ILI LLA|: ${llaAbs.toFixed(2)}`
+              ].join('\n')
+
+              if (passesByLla) {
+                return {
+                  result: 'validated',
+                  remarks: llaRemark,
+                  matchedQLI: qli,
+                  validationStep: 'Quote - Passed (Reseller discount 15% RC - LLA fallback)',
+                  effectiveLla: lla,
+                  llaCalculated,
+                  ella: NaN,
+                  cup: effectiveCup,
+                  fallbackUnitPrice,
+                  fallbackUnitPriceSource,
+                  unitPriceForCompare,
+                  effectiveCup
+                }
+              }
+
+              return {
+                result: 'failed',
+                remarks: llaRemark,
+                matchedQLI: qli,
+                validationStep: 'Quote - Failed (Reseller discount 15% RC)',
+                effectiveLla: lla,
+                llaCalculated,
+                ella: NaN,
+                cup: effectiveCup,
+                fallbackUnitPrice,
+                fallbackUnitPriceSource,
+                unitPriceForCompare,
+                effectiveCup
+              }
+            }
+
+            return {
+              result: 'failed',
+              remarks,
+              matchedQLI: qli,
+              validationStep: 'Quote - Failed (Reseller discount 15% RC)',
+              effectiveLla: lla,
+              llaCalculated,
+              ella: NaN,
+              cup: effectiveCup,
+              fallbackUnitPrice,
+              fallbackUnitPriceSource,
+              unitPriceForCompare,
+              effectiveCup
+            }
+          })()
+    }
+
     // When quantity is negative, use negative tolerance; when positive, use positive tolerance.
-    const signedPriceTolerance = quantity < 0 ? -priceTolerance : priceTolerance
+    const signedPriceTolerance =  priceTolerance
     // Unit price threshold: CUP * (1 + signedTolerance) so negative qty → CUP*(1-tolerance), positive qty → CUP*(1+tolerance)
     const unitPriceThresholdRaw = effectiveCup * (1 + signedPriceTolerance)
     const unitPriceThreshold = Math.round(unitPriceThresholdRaw * 100) / 100
     if (isNaN(effectiveCup) || effectiveCup === 0) {
       return { result: 'failed', remarks: 'No valid quote unit price (CUP) for date.', matchedQLI: qli, validationStep: 'Quote - Failed (No CUP)', effectiveLla: lla, llaCalculated, ella: NaN, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
     }
-
-    const fallbackNote = fallbackUnitPriceSource ? ` (QLI unit price derived from ${fallbackUnitPriceSource} / Quantity)` : ''
 
     const pf = getPF(ili)
     // Before comparing: if PF < 1, normalize unit price and LLA so that PF * (1/PF) = 1 (full-period equivalent)
@@ -651,20 +965,50 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
     // Fail when ILI unit price missing (NaN) - cannot validate; or when it exceeds CUP*(1+tolerance)
     // Note: NaN > x is false in JS, so we must explicitly check for NaN to fail when unit price is missing
     const unitPriceMissingOrInvalid = (isNaN(unitPriceForCompare) || unitPriceForCompare == null) && !isNaN(effectiveCup) && effectiveCup !== 0
-    const unitPriceExceedsTolerance = !isNaN(unitPriceForCompare) && (unitPriceForCompare) > (unitPriceThreshold)
+    const unitPriceExceedsTolerance = !isNaN(unitPriceForCompare) && Math.abs(unitPriceForCompare) > Math.abs(unitPriceThreshold)
     if (unitPriceExceedsTolerance || unitPriceMissingOrInvalid) {
-      const ella = effectiveCup * quantity * pf
-      const upDisplay = !isNaN(unitPrice) ? unitPrice.toFixed(2) : 'N/A'
-      const remarks = unitPriceMissingOrInvalid
-        ? `Cannot validate: ILI unit price missing or invalid. QLI CUP=${unitPriceThreshold.toFixed(2)}${fallbackNote}`
-        : `Unit price ${upDisplay} exceeds CUP*(1+tolerance)=${unitPriceThreshold}${fallbackNote}`
-      return { result: 'failed', remarks, matchedQLI: qli, validationStep: 'Quote - Failed (Unit price)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource, unitPriceForCompare, cup_within_tolerance: unitPriceThreshold, effectiveCup }
+      const qliQtyEarly = getQLIQuantity(qli)
+      const qliExtended = effectiveCup * qliQtyEarly*(1+signedPriceTolerance)
+      const iliQtyOne = quantity === 1
+      const canTryExtended =
+        iliQtyOne &&
+        !isNaN(qliQtyEarly) &&
+        qliQtyEarly !== 0 &&
+        !isNaN(lla) &&
+        lla !== 0
+      const extendedCoversLla = canTryExtended && qliExtended >= lla
+      if (extendedCoversLla) {
+        const remark = `All validations passed.${fallbackNote}\nEither quantity or unit price is wrong in QLI (passed: QLI computed unit price × QLI quantity covers ILI LLA).`
+        return {
+          result: 'validated',
+          remarks: remark,
+          matchedQLI: qli,
+          validationStep: 'Quote - Passed (QLI CUP×qty covers ILI LLA)',
+          effectiveLla: lla,
+          llaCalculated,
+          ella: effectiveCup * quantity * pf,
+          cup: effectiveCup,
+          fallbackUnitPrice,
+          fallbackUnitPriceSource,
+          qliQty: qliQtyEarly,
+          unitPriceForCompare,
+          cup_within_tolerance: unitPriceThreshold,
+          effectiveCup
+        }
+      } else {
+        const ella = effectiveCup * quantity * pf
+        const upDisplay = !isNaN(unitPrice) ? unitPrice.toFixed(2) : 'N/A'
+        const remarks = unitPriceMissingOrInvalid
+          ? `Cannot validate: ILI unit price missing or invalid. QLI CUP=${unitPriceThreshold.toFixed(2)}${fallbackNote}`
+          : `Unit price ${upDisplay} exceeds CUP*(1+tolerance)=${unitPriceThreshold}${fallbackNote}`
+        return { result: 'failed', remarks, matchedQLI: qli, validationStep: 'Quote - Failed (Unit price)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource, unitPriceForCompare, cup_within_tolerance: unitPriceThreshold, effectiveCup }
+      }
     }
 
     const finalizePass = (validationStep, remarks, qliQtyForMsg) => {
       const upDisplay = !isNaN(unitPrice) ? unitPrice.toFixed(2) : 'N/A'
       const qQtyDisplay = qliQtyForMsg !== undefined ? qliQtyForMsg : getQLIQuantity(qli)
-      if (!isNaN(unitPriceForCompare) && (unitPriceForCompare) > (unitPriceThreshold)) {
+      if (!isNaN(unitPriceForCompare) && Math.abs(unitPriceForCompare) > Math.abs(unitPriceThreshold)) {
         const ella = effectiveCup * quantity * pf
         return {
           result: 'failed',
@@ -700,20 +1044,65 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
       }
     }
     const qtyILI = quantity
-    // signedPriceTolerance already set above (negative when qty < 0, positive when qty > 0)
-    // Signed comparison only: ELLA same sign as CUP (and qty).
+    // LLA vs ELLA comparison intentionally disabled.
     const ella = effectiveCup * Math.abs(qtyILI) * pf
-    const ellaTol = ella * (1 + signedPriceTolerance)
-    const llaExceedsElla = llaForCompare > ellaTol
-    if (!isNaN(llaForCompare) && llaExceedsElla) {
-      const msg = qtyILI < 0
-        ? `LLA ${lla.toFixed(2)} is more negative than allowed ELLA*(1+tolerance)=${(ellaTol).toFixed(2)}${fallbackNote}`
-        : `LLA ${lla.toFixed(2)} exceeds ELLA*(1+tolerance)=${(ellaTol).toFixed(2)}${fallbackNote}`
-      return { result: 'failed', remarks: msg, matchedQLI: qli, validationStep: 'Quote - Failed (LLA)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
-    }
+    // const ellaTol = ella * (1 + signedPriceTolerance)
+    // const llaExceedsElla = llaForCompare > ellaTol
+    // if (!isNaN(llaForCompare) && llaExceedsElla) {
+    //   const msg = qtyILI < 0
+    //     ? `LLA ${lla.toFixed(2)} is more negative than allowed ELLA*(1+tolerance)=${(ellaTol).toFixed(2)}${fallbackNote}`
+    //     : `LLA ${lla.toFixed(2)} exceeds ELLA*(1+tolerance)=${(ellaTol).toFixed(2)}${fallbackNote}`
+    //   return { result: 'failed', remarks: msg, matchedQLI: qli, validationStep: 'Quote - Failed (LLA)', effectiveLla: lla, llaCalculated, ella, cup: effectiveCup, fallbackUnitPrice, fallbackUnitPriceSource }
+    // }
     const qliQty = getQLIQuantity(qli)
     if (isNaN(qliQty) || qliQty === 0) {
-      return finalizePass('Quote - Passed (No quote quantity)', `No quote quantity on matched QLI.${fallbackNote}`, qliQty)
+      const ct = iliChargeTypeNorm
+      const isNrcOtc = ct === 'NRC' || ct === 'OTC'
+      const isRcFamily = ct === 'RC' || ct === 'MRC' || ct === 'RC CREDIT'
+      const isResellerIli = ct === 'RESELLER DISCOUNT'
+
+      // Reseller Discount ILI matched on non–reseller-discount path: still require QLI qty for audit (no generic pass).
+      if (isResellerIli) {
+        return {
+          result: 'failed',
+          remarks: `Reseller Discount: matched QLI has no quantity; cannot complete validation.${fallbackNote}`,
+          matchedQLI: qli,
+          validationStep: 'Quote - Failed (Reseller discount - no QLI qty)',
+          effectiveLla: lla,
+          llaCalculated,
+          ella,
+          cup: effectiveCup,
+          fallbackUnitPrice,
+          fallbackUnitPriceSource,
+          unitPriceForCompare,
+          cup_within_tolerance: unitPriceThreshold,
+          effectiveCup
+        }
+      }
+
+      // NRC/OTC: qty optional — pass only on unit price vs CUP (already passed to reach here).
+      if (isNrcOtc) {
+        return finalizePass(
+          'Quote - Passed (NRC/OTC - no QLI qty)',
+          `NRC/OTC: QLI quantity missing or zero; passed on unit price vs CUP only (quantity optional).${fallbackNote}`,
+          qliQty
+        )
+      }
+
+      // RC / MRC / RC CREDIT / others: amount-only — document that validation is unit price vs CUP only.
+      if (isRcFamily || !ct) {
+        return finalizePass(
+          'Quote - Passed (Amount-only)',
+          `Amount-only validation: QLI quantity missing or zero; unit price vs CUP already passed.${fallbackNote}`,
+          qliQty
+        )
+      }
+
+      return finalizePass(
+        'Quote - Passed (Amount-only)',
+        `Amount-only validation: QLI quantity missing or zero; unit price vs CUP already passed (${ct || 'unknown'} charge type).${fallbackNote}`,
+        qliQty
+      )
     }
     const qtyExceedsQuote = Math.abs(qtyILI) > Math.abs(qliQty) * (1 + qtyTolerance)
     if (qtyExceedsQuote) {
@@ -726,8 +1115,20 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
     return finalizePass('Quote - Passed', `All validations passed.${fallbackNote}`, qliQty)
   }
 
+  function validateWithCurrencyRemark(qliCandidate) {
+    const res = validateWithQLI(qliCandidate)
+    if (!res || !res.matchedQLI) return res
+    const qliCurr = getValue(res.matchedQLI, QLI_CURRENCY_VARIANTS)
+    const qliCurrNorm = qliCurr ? String(qliCurr).trim().toUpperCase() : ''
+    if (iliCurrNorm && qliCurrNorm && qliCurrNorm !== iliCurrNorm) {
+      const msg = `Currency mismatch: ILI CURR=${iliCurrNorm} vs QLI Currency=${qliCurrNorm}`
+      res.remarks = res.remarks ? `${res.remarks}\n${msg}` : msg
+    }
+    return res
+  }
+
   const qli = selectedQLI
-  return validateWithQLI(qli)
+  return validateWithCurrencyRemark(qli)
 }
 
 /**
@@ -743,6 +1144,7 @@ export function validateILIAgainstQLIs(ili, qlis, options) {
 export function runValidation(baseData, quoteData, options = {}) {
   const results = []
   const bySerial = indexQuotesBySerialNumber(quoteData)
+  const useQuoteSerialFilter = options.useQuoteSerialFilter !== false
   let passedCount = 0
   let failedCount = 0
   let rateCardCount = 0
@@ -778,8 +1180,12 @@ export function runValidation(baseData, quoteData, options = {}) {
       ili_desc_tokens: formatCDTokensForDisplay(parseSentenceCD(iliDesc)),
       qli_desc_tokens: '',
       desc_match_percentage: '',
+      qli_cd_best_effort: '',
+      // ILI recurring period (same source as billing from/till; YYYY-MM-DD for UI/export)
+      ili_recurring_from_date: formatDateForDisplay(getValue(ili, ILI_RECURRING_CHARGE_FROM_VARIANTS)),
+      ili_recurring_to_date: formatDateForDisplay(getValue(ili, ILI_RECURRING_CHARGE_TO_VARIANTS)),
       // check from down (dates formatted for display: Excel serial -> YYYY-MM-DD)
-      ili_invoice_start_date: formatDateForDisplay(getValue(ili, ILI_SERVICE_START_VARIANTS)),
+      ili_service_start_date: formatDateForDisplay(getValue(ili, ILI_SERVICE_START_VARIANTS)),
       ili_renewal_term: getValue(ili, "RENEWAL_TERM"),
       ili_first_Price_increment_applicable_after: getValue(ili, "FIRST_PRICE_INC_APP_AFTER"),
       ili_price_increase_percentage: getValue(ili, "PRICE_INCREASE_PERCENTAGE"),
@@ -789,7 +1195,9 @@ export function runValidation(baseData, quoteData, options = {}) {
       expected_result: getExpectedResultFromBaseRow(ili),
       validation_result: '',
       validation_step: '',
-      remarks: ''
+      remarks: '',
+      quote_skip_item_code_remark: '',
+      quote_skip_description_remark: ''
     }
     const rawLla = baseResult.lla
     const up = baseResult.unit_price
@@ -802,32 +1210,65 @@ export function runValidation(baseData, quoteData, options = {}) {
       baseResult.lla_calculated = false
     }
 
-    // Serial number filter (mandatory): ILI must have a serial number to attempt quote validation
-    if (!serialTrimmed) {
-      baseResult.validation_result = 'Skipped'
-      baseResult.validation_step = 'Quote - No match (No Serial on ILI)'
-      baseResult.remarks = 'ILI has no Serial number; cannot match quote by Serial.'
-      setQuoteSkipReason(baseResult, baseResult.validation_step, baseResult.remarks)
-      rateCardCount++
-      results.push(baseResult)
-      continue
+    let qlis = []
+    if (useQuoteSerialFilter) {
+      // Serial number filter (mandatory): ILI must have a serial number to attempt quote validation
+      if (!serialTrimmed) {
+        baseResult.validation_result = 'Skipped'
+        baseResult.validation_step = 'Quote - No match (No Serial on ILI)'
+        baseResult.remarks = 'ILI has no Serial number; cannot match quote by Serial.'
+        setQuoteSkipReason(baseResult, baseResult.validation_step, baseResult.remarks)
+        applyQuoteSkipSplitColumns(baseResult)
+        rateCardCount++
+        results.push(baseResult)
+        continue
+      }
+
+      const key = serialTrimmed.toUpperCase()
+      qlis = bySerial[key] || []
+
+      // Serial filter: no QLIs for this serial → rate card
+      if (qlis.length === 0) {
+        baseResult.validation_result = 'Skipped'
+        baseResult.validation_step = 'Quote - No match (No QLI for Serial)'
+        baseResult.remarks = 'No matching quote line items for this Serial number.'
+        setQuoteSkipReason(baseResult, baseResult.validation_step, baseResult.remarks)
+        applyQuoteSkipSplitColumns(baseResult)
+        rateCardCount++
+        results.push(baseResult)
+        continue
+      }
+    } else {
+      // Skip serial filter: try matching against all quote line items.
+      qlis = quoteData || []
+      if (qlis.length === 0) {
+        baseResult.validation_result = 'Skipped'
+        baseResult.validation_step = 'Quote - No match (No QLI candidates)'
+        baseResult.remarks = 'No quote line items available to match.'
+        setQuoteSkipReason(baseResult, baseResult.validation_step, baseResult.remarks)
+        applyQuoteSkipSplitColumns(baseResult)
+        rateCardCount++
+        results.push(baseResult)
+        continue
+      }
     }
 
-    const key = serialTrimmed.toUpperCase()
-    const qlis = bySerial[key] || []
-
-    // Serial filter: no QLIs for this serial → rate card
-    if (qlis.length === 0) {
-      baseResult.validation_result = 'Skipped'
-      baseResult.validation_step = 'Quote - No match (No QLI for Serial)'
-      baseResult.remarks = 'No matching quote line items for this Serial number.'
-      setQuoteSkipReason(baseResult, baseResult.validation_step, baseResult.remarks)
-      rateCardCount++
-      results.push(baseResult)
-      continue
-    }
-
-    const { result, remarks, matchedQLI, validationStep, effectiveLla, llaCalculated, ella, cup, fallbackUnitPrice, fallbackUnitPriceSource, unitPriceForCompare, cup_within_tolerance, effectiveCup } = validateILIAgainstQLIs(ili, qlis, options)
+    const {
+      result,
+      remarks,
+      matchedQLI,
+      validationStep,
+      effectiveLla,
+      llaCalculated,
+      ella,
+      cup,
+      fallbackUnitPrice,
+      fallbackUnitPriceSource,
+      unitPriceForCompare,
+      cup_within_tolerance,
+      effectiveCup,
+      bestCdMatch
+    } = validateILIAgainstQLIs(ili, qlis, options)
     baseResult.remarks = remarks
     baseResult.validation_step = validationStep || ''
     if (effectiveLla !== undefined) {
@@ -865,6 +1306,23 @@ export function runValidation(baseData, quoteData, options = {}) {
       baseResult.qli_renewal_term = getValue(matchedQLI, "renewal term")
       baseResult.qli_first_Price_increment_applicable_after = getValue(matchedQLI, "first_Price_increment_applicable_after")
       baseResult.qli_price_increase_percentage = getValue(matchedQLI, "price_increase_percentage")
+    } else if (bestCdMatch && bestCdMatch.qli) {
+      const bq = bestCdMatch.qli
+      const descText = (bestCdMatch.qliDescForTokens || getQLIChargeDesc(bq) || getQLIChangeDesc(bq) || '').trim()
+      baseResult.qli_number = getValue(bq, ['Number', 'QLI_NUMBER', 'Line Number', 'line_number'])
+      baseResult.qli_serial_number = getQLISerial(bq)
+      baseResult.qli_po_number = getValue(bq, "Po Number")
+      baseResult.qli_currency = getValue(bq, QLI_CURRENCY_VARIANTS)
+      baseResult.qli_site_id = getQLISiteId(bq)
+      baseResult.qli_item_code = getQLIProductCode(bq)
+      baseResult.qli_quantity = getQLIQuantity(bq)
+      baseResult.qli_description = descText
+      baseResult.qli_desc_tokens = descText
+        ? formatCDTokensForDisplay(parseSentenceCD(descText))
+        : ''
+      baseResult.desc_match_percentage =
+        bestCdMatch.matchCount !== undefined && bestCdMatch.matchCount !== null ? bestCdMatch.matchCount : ''
+      baseResult.qli_cd_best_effort = true
     }
 
     if (result === 'validated') {
@@ -880,6 +1338,7 @@ export function runValidation(baseData, quoteData, options = {}) {
       setQuoteSkipReason(baseResult, baseResult.validation_step, baseResult.remarks)
       rateCardCount++
     }
+    applyQuoteSkipSplitColumns(baseResult)
     results.push(baseResult)
   }
 

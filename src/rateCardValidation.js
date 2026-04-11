@@ -23,9 +23,10 @@ const ILI_REGION_VARIANTS = ['region', 'REGION', 'Region']
 const ILI_IBX_VARIANTS = ['IBX', 'ibx', 'ibx_center', 'IBX_CENTER']
 const ILI_BUSINESS_UNIT_VARIANTS = ['BUSINESS_UNIT', 'business_unit', 'Business Unit']
 const ILI_CURR_VARIANTS = ['CURR', 'curr', 'currency', 'Currency']
+/** When set (e.g. Interconnection), findRateCard narrows candidates to this u_rate_card_sub_type. */
 const ILI_CATEGORY_VARIANTS = ['CATEGORY', 'category', 'Category']
 const ILI_CHARGE_TYPE_VARIANTS = ['CHARGE_TYPE', 'charge_type', 'Charge Type']
- 
+
 const RC_SUB_TYPE_VARIANTS = ['u_rate_card_sub_type', 'rate_card_sub_type', 'Rate Card Sub Type', 'Rate Card Sub-Type']
 const RC_COUNTRY_VARIANTS = ['u_country', 'country', 'Country']
 const RC_REGION_VARIANTS = ['u_region', 'region', 'Region']
@@ -35,7 +36,22 @@ const RC_PRICE_KVA_VARIANTS = ['u_pricekva', 'pricekva', 'Price per kVA', 'MRC R
 const RC_RATE_VARIANTS = ['u_rate', 'rate', 'Rate', 'MRC Rate']
 const RC_NRC_VARIANTS = ['u_nrc', 'nrc', 'NRC', 'NRC Rate', 'Non-Recurring Charge']
 const RC_ICB_FLAG_VARIANTS = ['u_icb_flag', 'icb_flag', 'ICB Flag']
-const RC_GOODS_SERVICES_VARIANTS = ['u_goods_services', 'u_goods_services_category', 'goods_services', 'Goods Services', 'Goods or Services', 'Goods or Services Category']
+// Note: keep "goods services" and "goods/services category" separate so we don't accidentally pick the wrong one.
+const RC_GOODS_SERVICES_VARIANTS = [
+  'u_goods_services',
+  'goods_services',
+  'Goods Services',
+  'Goods or Services',
+  'Goods or Services (Type)',
+]
+const RC_GOODS_SERVICES_CATEGORY_VARIANTS = [
+  'u_goods_services_category',
+  'goods_services_category',
+  'Goods or Services Category',
+  'Goods Services Category',
+  'Goods or Services Category (Type)',
+]
+const RC_PHASE_VARIANTS = ['u_phase', 'phase', 'PHASE', 'Phase']
 const RC_ALL_IBX_VARIANTS = ['u_all_ibx', 'All IBXs']
 const RC_IBXS_VARIANTS = ['u_ibxs', 'IBX', 'IBX (2)']
 const RC_EXCLUDED_IBXS_VARIANTS = ['u_excluded_ibxs', 'Excluded IBXs']
@@ -110,6 +126,43 @@ export function formatDateForDisplay(value) {
 function getIliChargeDesc(ili) {
   return getValue(ili, ILI_DESC_VARIANTS)
 }
+
+/**
+ * Strip invoice metadata from ILI charge description so CD similarity targets the service text
+ * (e.g. Equinix Fabric, bandwidth, AWS) — not UUIDs or "Recurring Charge-01-NOV-2025..." tails.
+ */
+function sanitizeChargeDescForRateCard(desc) {
+  if (!desc) return ''
+  let s = String(desc)
+  // Remove GUIDs
+  s = s.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ' ')
+  // Drop trailing recurring charge / date noise
+  s = s.replace(/\s*-?\s*Recurring\s+Charge[\s\S]*$/i, '')
+  s = s.replace(/\s*--\s*$/g, '')
+  s = s.replace(/\s+/g, ' ').trim()
+  return s
+}
+
+/** Prefer RC rows whose synthesized desc shares more distinct keywords with the ILI (tie-break). */
+function keywordOverlapCount(iliDesc, rcDesc) {
+  const words = String(iliDesc || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(w => w.length > 2)
+  const rc = String(rcDesc || '').toLowerCase()
+  let n = 0
+  for (const w of words) {
+    if (rc.includes(w)) n++
+  }
+  return n
+}
+
+/** Strong tie-break: ILI product code appears in RC synthesized text (e.g. ECX00015). */
+function productCodeOverlapBoost(ili, rcDesc) {
+  const pc = getValue(ili, ['PRODUCT_CODE', 'product_code', 'Product Code']).trim().toLowerCase()
+  if (!pc || !rcDesc) return 0
+  return rcDesc.toLowerCase().includes(pc) ? 100 : 0
+}
  
 function getIliServiceStart(ili) {
   return getValue(ili, ILI_SERVICE_START_VARIANTS)
@@ -141,6 +194,28 @@ function getIliCategory(ili) {
 
 function getIliChargeType(ili) {
   return getValue(ili, ILI_CHARGE_TYPE_VARIANTS)
+}
+
+/**
+ * Map invoice category/charge type to the most likely RC sub types.
+ * Prevents broad candidate pools (and wrong RLI picks) for categories like "Power".
+ */
+function getExpectedRcSubTypesForIli(ili) {
+  const category = getIliCategory(ili).toLowerCase()
+  const chargeType = getIliChargeType(ili).toLowerCase()
+  const productCode = getValue(ili, ['PRODUCT_CODE', 'product_code', 'Product Code']).toUpperCase()
+
+  if (category === 'interconnection') return ['Interconnection']
+  if (category === 'space') return ['Space & Power', 'Secure Cabinet Express', 'Cabinet Install NRC']
+  if (category === 'service') return ['Smart Hands', 'Equinix Precision Time']
+  if (category === 'power') {
+    if (chargeType.includes('nrc')) return ['Power Install NRC']
+    if (chargeType.includes('rc')) return ['Space & Power']
+    return ['Space & Power', 'Power Install NRC']
+  }
+  // Product-code heuristic for power items in messy/legacy invoices.
+  if (productCode.startsWith('POW')) return ['Space & Power', 'Power Install NRC']
+  return []
 }
  
 /**
@@ -190,8 +265,23 @@ function isServiceStartInEffectiveWindow(serviceStartDate, window) {
 }
  
 /**
+ * True if ILI site code matches a token from the rate card IBX list (exact or prefix).
+ * Rate cards often list a metro prefix (e.g. "TR") while ILI IBX is a specific site ("TR1", "TR2").
+ */
+function ibxSiteMatchesToken(iliIbx, token) {
+  const ili = String(iliIbx || '').trim().toUpperCase()
+  const t = String(token || '').trim().toUpperCase()
+  if (!ili || !t) return false
+  if (ili === t) return true
+  if (ili.startsWith(t)) return true
+  if (t.startsWith(ili)) return true
+  return false
+}
+
+/**
 * IBX filter (mirrors completeQuery/determineIBXQuery): rate card row must apply to ILI's IBX.
 * - u_all_ibx = false: u_ibxs must contain ILI IBX (comma-separated list or single value).
+*   Tokens match exact site (TR1) or prefix (TR matches TR1, TR2) — not only list.includes(TR1).
 * - u_all_ibx = true and u_excluded_ibxs non-empty: ILI IBX must NOT be in u_excluded_ibxs.
 * - u_all_ibx = true and u_excluded_ibxs empty: applies to all IBX.
 */
@@ -202,13 +292,24 @@ function rateCardAppliesToIbx(rcRow, iliIbx) {
   if (!isAllIbx) {
     const ibxs = getValue(rcRow, RC_IBXS_VARIANTS)
     if (!ibxs) return false
-    const list = ibxs.split(',').map(s => s.trim().toUpperCase())
-    return list.includes(iliIbx.toUpperCase())
+    const list = ibxs.split(',').map(s => s.trim()).filter(Boolean)
+    return list.some(tok => ibxSiteMatchesToken(iliIbx, tok))
   }
   const excluded = getValue(rcRow, RC_EXCLUDED_IBXS_VARIANTS)
   if (!excluded) return true
-  const excludedList = excluded.split(',').map(s => s.trim().toUpperCase())
-  return !excludedList.includes(iliIbx.toUpperCase())
+  const excludedList = excluded.split(',').map(s => s.trim()).filter(Boolean)
+  return !excludedList.some(tok => ibxSiteMatchesToken(iliIbx, tok))
+}
+
+function formatRcIbxScope(rcRow) {
+  const allIbxRaw = String(getValue(rcRow, RC_ALL_IBX_VARIANTS) || '').trim().toLowerCase()
+  const isAllIbx = allIbxRaw === 'true' || allIbxRaw === '1' || allIbxRaw === 'yes'
+  if (isAllIbx) {
+    const excluded = String(getValue(rcRow, RC_EXCLUDED_IBXS_VARIANTS) || '').trim()
+    return excluded ? `ALL (excl: ${excluded})` : 'ALL'
+  }
+  const ibxs = String(getValue(rcRow, RC_IBXS_VARIANTS) || '').trim()
+  return ibxs || ''
 }
  
 /**
@@ -320,31 +421,36 @@ function checkExactRateCardEntry(rcRow, chargeDesc, fieldArr) {
 /**
 * Pre-filter rate card rows by ILI attributes (u_currency/CURR, Rate_card_type/CATEGORY,
 * country, region, effective dates, IBX). Applied before charge description matching.
+* @param {{ skipCurrency?: boolean }} [options] - If true, match country/region/IBX only (invoice USD vs RC JPY is common for Japan/APAC).
 */
-function preFilterRateCardByIliAttributes(rateCardData, ili, serviceStartDate) {
+function preFilterRateCardByIliAttributes(rateCardData, ili, serviceStartDate, options = {}) {
+  const skipCurrency = options.skipCurrency === true
   const country = getIliCountry(ili)
   const region = getIliRegion(ili)
   const iliIbx = getIliIbx(ili)
   const iliCurr = getIliCurr(ili)
 
   const key = `${String(iliCurr || '').trim().toUpperCase()}|${String(country || '').trim()}|${String(region || '').trim().toUpperCase()}`
-  const base = (rateCardData && rateCardData.__byTriple && rateCardData.__byTriple.get(key)) ? rateCardData.__byTriple.get(key) : (rateCardData || [])
+  // Currency-relaxed pass must scan all RLIs (index is keyed by currency|country|region).
+  const base = skipCurrency
+    ? (rateCardData || [])
+    : ((rateCardData && rateCardData.__byTriple && rateCardData.__byTriple.get(key)) ? rateCardData.__byTriple.get(key) : (rateCardData || []))
 
   return base.filter(rc => {
     const rcCurrency = getValue(rc, RC_CURRENCY_VARIANTS)
-    if (iliCurr) {
+    if (!skipCurrency && iliCurr) {
       if (!rcCurrency) return false
       if (String(rcCurrency).trim().toUpperCase() !== String(iliCurr).trim().toUpperCase()) return false
     }
     const rcCountry = getValue(rc, RC_COUNTRY_VARIANTS)
     if (country) {
       if (!rcCountry) return false
-      if (rcCountry !== country) return false
+      if (String(rcCountry).trim().toLowerCase() !== String(country).trim().toLowerCase()) return false
     }
     const rcRegion = getValue(rc, RC_REGION_VARIANTS)
     if (region) {
       if (!rcRegion) return false
-      if (rcRegion !== region) return false
+      if (String(rcRegion).trim().toUpperCase() !== String(region).trim().toUpperCase()) return false
     }
     // Service start date filter intentionally skipped (user requirement).
     if (!rateCardAppliesToIbx(rc, iliIbx)) return false
@@ -362,9 +468,14 @@ function buildRateCardDesc(rcRow) {
     getValue(rcRow, RC_SUB_TYPE_VARIANTS),
     getValue(rcRow, RC_RATE_CARD_VARIANTS),
     getValue(rcRow, RC_GOODS_SERVICES_VARIANTS),
+    getValue(rcRow, RC_GOODS_SERVICES_CATEGORY_VARIANTS),
+    getRcValue(rcRow, 'u_amps'),
+    getRcValue(rcRow, 'u_phase') || getValue(rcRow, RC_PHASE_VARIANTS),
+    getRcValue(rcRow, 'u_volt'),
     getValue(rcRow, RC_PARAMETER1_VARIANTS),
     getValue(rcRow, RC_PARAMETER2_VARIANTS),
     getValue(rcRow, ['u_product_name', 'product_name', 'Product Name']),
+    getValue(rcRow, ['u_service_name', 'service_name', 'Service Name', 'u_service']),
     getValue(rcRow, ['u_circuit_type', 'circuit_type', 'Circuit Type']),
     getValue(rcRow, ['u_bandwidth', 'bandwidth', 'Bandwidth']),
     getValue(rcRow, ['u_metro', 'metro', 'Metro']),
@@ -399,21 +510,72 @@ function ensureRateCardIndex(rateCardData) {
 * Then categories evaluated in CATEGORY_ORDER (charge desc match); key + subkey required when defined.
 */
 function findRateCard(ili, rateCardData, configArray) {
-  const chargeDesc = getIliChargeDesc(ili)
+  const rawChargeDesc = getIliChargeDesc(ili)
+  const chargeDesc = sanitizeChargeDescForRateCard(rawChargeDesc)
   ensureRateCardIndex(rateCardData)
-  const preFiltered = preFilterRateCardByIliAttributes(rateCardData, ili, null)
+  let preFiltered = preFilterRateCardByIliAttributes(rateCardData, ili, null)
 
-  // New: CD similarity match (same threshold as quote validation)
+  const iliCategory = getValue(ili, ILI_CATEGORY_VARIANTS)
+  let candidates = preFiltered
+  const expectedSubTypes = getExpectedRcSubTypesForIli(ili)
+  if (expectedSubTypes.length > 0) {
+    const narrowedByExpectedType = preFiltered.filter(rc => {
+      const st = getValue(rc, RC_SUB_TYPE_VARIANTS)
+      return expectedSubTypes.includes(st)
+    })
+    if (narrowedByExpectedType.length > 0) candidates = narrowedByExpectedType
+  }
+  if (iliCategory) {
+    const catLower = iliCategory.trim().toLowerCase()
+    const narrowed = candidates.filter(rc => {
+      const st = getValue(rc, RC_SUB_TYPE_VARIANTS)
+      if (!st) return false
+      const stLower = st.trim().toLowerCase()
+      if (stLower === catLower) return true
+      return false
+    })
+    if (narrowed.length > 0) candidates = narrowed
+  }
+
+  // CD similarity (same threshold as quote validation); tie-break on keyword overlap with ILI
   if (!chargeDesc) return null
   let best = null
-  for (const rc of preFiltered) {
+  for (const rc of candidates) {
     if (getValue(rc, RC_ICB_FLAG_VARIANTS).toLowerCase() === 'true') continue
     const rcDesc = buildRateCardDesc(rc)
     if (!rcDesc) continue
     const { score, passes } = calculateCDSimilarity(chargeDesc, rcDesc)
     if (!passes) continue
-    if (!best || score > best.score) {
-      best = { rc, score, rcDesc }
+    const overlap = keywordOverlapCount(chargeDesc, rcDesc)
+    const prodBoost = productCodeOverlapBoost(ili, rcDesc)
+    if (
+      !best ||
+      score > best.score ||
+      (score === best.score && prodBoost > best.prodBoost) ||
+      (score === best.score && prodBoost === best.prodBoost && overlap > best.overlap)
+    ) {
+      best = { rc, score, rcDesc, overlap, prodBoost }
+    }
+  }
+  // If strict CD pass finds nothing (metadata-heavy ILI text), use best row still >= fallback min
+  const CD_FALLBACK_MIN = 52
+  if (!best) {
+    for (const rc of candidates) {
+      if (getValue(rc, RC_ICB_FLAG_VARIANTS).toLowerCase() === 'true') continue
+      const rcDesc = buildRateCardDesc(rc)
+      if (!rcDesc) continue
+      const { score } = calculateCDSimilarity(chargeDesc, rcDesc)
+      const overlap = keywordOverlapCount(chargeDesc, rcDesc)
+      const prodBoost = productCodeOverlapBoost(ili, rcDesc)
+      if (score < CD_FALLBACK_MIN) continue
+      if (
+        !best ||
+        score > best.score ||
+        (score === best.score && prodBoost > best.prodBoost) ||
+        (score === best.score && prodBoost === best.prodBoost && overlap > best.overlap)
+      ) {
+        best = { rc, score, rcDesc, overlap, prodBoost }
+      }
     }
   }
   if (!best) return null
@@ -461,6 +623,10 @@ function getRateCardUnitPrice(rcRow, subType, chargeDesc) {
 * - If both ILI unit price and RLI (CUP) are 0 → Pass
 * - If ILI unit price > CUP * (1 + tolerance) → Failed
 * - Else → Pass
+*
+* @param {object} [options]
+* @param {number} [options.priceTolerance]
+* @param {boolean} [options.oosNoQuoteSerial] - true when quote had no QLI for serial; uses shorter remark if no RC match (no long contract boilerplate).
 */
 export function validateWithRateCard(ili, rateCardData, configArray, options = {}) {
   const priceTolerance = options.priceTolerance != null ? options.priceTolerance : 0.05
@@ -478,9 +644,13 @@ export function validateWithRateCard(ili, rateCardData, configArray, options = {
  
   const found = findRateCard(ili, rateCardData, configArray)
   if (!found) {
+    const longNoMatchRemark =
+      'Out-of-Scope Item. This line item is not a part of the contract; and no rate card reference is available to validate the price. Validation has been skipped due to missing rate card information. This Line item will be handled manually.'
     return {
       result: 'skipped',
-      remarks: 'Out-of-Scope Item. This line item is not a part of the contract; and no rate card reference is available to validate the price. Validation has been skipped due to missing rate card information. This Line item will be handled manually.'
+      remarks: options.oosNoQuoteSerial
+        ? 'OOS validation: no rate card line matched.'
+        : longNoMatchRemark
     }
   }
  
@@ -493,17 +663,22 @@ export function validateWithRateCard(ili, rateCardData, configArray, options = {
     rc_u_rate_card: getValue(rc, RC_RATE_CARD_VARIANTS),
     rc_u_rate_card_sub_type: subType || getValue(rc, RC_SUB_TYPE_VARIANTS),
     rc_u_goods_services: getValue(rc, RC_GOODS_SERVICES_VARIANTS),
+    rc_u_currency: getValue(rc, RC_CURRENCY_VARIANTS),
     rc_u_effective_from: getValue(rc, RC_EFFECTIVE_FROM_VARIANTS),
     rc_effective_till: getValue(rc, RC_EFFECTIVE_TILL_VARIANTS),
     rc_u_country: getValue(rc, RC_COUNTRY_VARIANTS),
     rc_u_region: getValue(rc, RC_REGION_VARIANTS),
+    rc_ibx: formatRcIbxScope(rc),
     rc_unit_price_used: isNaN(cup) ? '' : cup,
     rc_u_pricekva: getValue(rc, RC_PRICE_KVA_VARIANTS) ? (getNumeric(rc, RC_PRICE_KVA_VARIANTS) || '') : '',
     rc_u_rate: getValue(rc, RC_RATE_VARIANTS) ? (getNumeric(rc, RC_RATE_VARIANTS) || '') : '',
     rc_u_nrc: getValue(rc, RC_NRC_VARIANTS) ? (getNumeric(rc, RC_NRC_VARIANTS) || '') : '',
     rc_u_minimum_cabinet_density: getValue(rc, RC_MIN_CABINET_DENSITY_VARIANTS),
     rc_u_parameter1: getValue(rc, RC_PARAMETER1_VARIANTS),
-    rc_u_goods_services_category: getValue(rc, RC_GOODS_SERVICES_VARIANTS),
+    rc_u_parameter2: getValue(rc, RC_PARAMETER2_VARIANTS),
+    rc_u_circuit_type: getValue(rc, ['u_circuit_type', 'circuit_type', 'Circuit Type']),
+    rc_u_phase: getRcValue(rc, 'u_phase') || getValue(rc, RC_PHASE_VARIANTS),
+    rc_u_goods_services_category: getValue(rc, RC_GOODS_SERVICES_CATEGORY_VARIANTS),
     rc_u_amps: getRcValue(rc, 'u_amps'),
     rc_u_volt: getRcValue(rc, 'u_volt'),
     rc_u_icb_flag: getValue(rc, RC_ICB_FLAG_VARIANTS),
@@ -513,7 +688,8 @@ export function validateWithRateCard(ili, rateCardData, configArray, options = {
 
   // If we found a matching RC line item after filters + CD matching, treat as pass.
   // (User requirement: don't fail by price once RC match exists.)
-  return { result: 'validated', remarks: 'Rate card line item matched (filters + CD); validation passed.', ...rcFields }
+  let remark = 'Rate card line item matched (filters + CD); validation passed.'
+  return { result: 'validated', remarks: remark, ...rcFields }
 
   if (getValue(rc, RC_ICB_FLAG_VARIANTS).toLowerCase() === 'true') {
     return {

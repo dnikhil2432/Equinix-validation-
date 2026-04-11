@@ -72,12 +72,18 @@ function isQLIValidation(row) {
 function isRCValidation(row) {
   return (row.validation_step || '').includes('Rate Card')
 }
+function isMovedToRC(row) {
+  const step = (row.validation_step || '')
+  return Boolean(row.quote_skip_stage) || step.startsWith('Quote - No match') || step.includes('Rate Card')
+}
 
 // Column order and labels for Excel export (all UI columns so download is complete and reviewable without lag)
 const EXPORT_COLUMNS = [
   ['row', 'Row'],
   ['quote_skip_stage', 'Quote skipped at (stage)'],
-  ['quote_skip_reason', 'Quote skip — stage & remarks'],
+  ['quote_skip_reason', 'Quote skip (reason)'],
+  ['quote_skip_item_code_remark', 'Quote skip — item code remark'],
+  ['quote_skip_description_remark', 'Quote skip — description remark'],
   ['serial_number', 'ILI Serial Number'],
   ['qli_serial_number', 'QLI Serial Number'],
   ['line_number', 'Line Number'],
@@ -108,9 +114,12 @@ const EXPORT_COLUMNS = [
   ['ili_desc_tokens', 'ILI Desc Tokens'],
   ['qli_desc_tokens', 'QLI Desc Tokens'],
   ['desc_match_percentage', 'Desc Match %'],
-  ['ili_invoice_start_date', 'ILI Invoice Start Date'],
+  ['qli_cd_best_effort', 'QLI CD (best effort)'],
+  ['ili_service_start_date', 'ILI SERVICE_START_DATE'],
   ['qli_invoice_start_date', 'QLI Invoice Start Date'],
   ['qli_line_item_service_start_date', 'QLI Line Item Service Start Date'],
+  ['ili_recurring_from_date', 'ILI Recurring From Date'],
+  ['ili_recurring_to_date', 'ILI Recurring To Date'],
   ['ili_renewal_term', 'ILI Renewal Term'],
   ['qli_renewal_term', 'QLI Renewal Term'],
   ['ili_first_Price_increment_applicable_after', 'ILI First Price Inc After'],
@@ -143,7 +152,7 @@ const EXPORT_COLUMNS = [
   ['remarks', 'Remarks']
 ]
 
-const DATE_EXPORT_KEYS = new Set(['ili_invoice_start_date', 'qli_invoice_start_date', 'qli_line_item_service_start_date', 'ili_billing_from', 'ili_billing_till', 'rc_u_effective_from', 'rc_effective_till'])
+const DATE_EXPORT_KEYS = new Set(['ili_service_start_date', 'qli_invoice_start_date', 'qli_line_item_service_start_date', 'ili_recurring_from_date', 'ili_recurring_to_date', 'ili_billing_from', 'ili_billing_till', 'rc_u_effective_from', 'rc_effective_till'])
 
 function rowToExportRow(result) {
   const out = {}
@@ -152,6 +161,7 @@ function rowToExportRow(result) {
     if (v === undefined || v === null) v = ''
     else if (typeof v === 'number' && isNaN(v)) v = ''
     else if (key === 'lla_calculated') v = v ? 'Yes' : ''
+    else if (key === 'qli_cd_best_effort') v = v ? 'Yes' : ''
     else if (key === 'quote_skip_reason' && typeof v === 'string' && v.includes('\n')) v = v.replace(/\n+/g, ' | ')
     else if (DATE_EXPORT_KEYS.has(key) && v !== '') v = formatDateForDisplay(v) || v
     out[label] = v
@@ -173,6 +183,8 @@ const ResultRow = memo(function ResultRow({ result }) {
           '-'
         )}
       </td>
+      <td className="quote-skip-remark-split-cell">{result.quote_skip_item_code_remark || '-'}</td>
+      <td className="quote-skip-remark-split-cell">{result.quote_skip_description_remark || '-'}</td>
       <td>{result.serial_number ?? '-'}</td>
       <td>{result.qli_serial_number ?? '-'}</td>
       <td>{result.ili_number ?? '-'}</td>
@@ -201,9 +213,12 @@ const ResultRow = memo(function ResultRow({ result }) {
       <td className="desc-cell tokens-cell">{result.ili_desc_tokens ?? '-'}</td>
       <td className="desc-cell tokens-cell">{result.qli_desc_tokens ?? '-'}</td>
       <td className="qty-cell">{result.desc_match_percentage !== undefined && result.desc_match_percentage !== '' ? `${result.desc_match_percentage}%` : '-'}</td>
-      <td>{formatDateForDisplay(result.ili_invoice_start_date) || '-'}</td>
+      <td>{result.qli_cd_best_effort ? 'Yes' : '-'}</td>
+      <td>{formatDateForDisplay(result.ili_service_start_date) || '-'}</td>
       <td>{formatDateForDisplay(result.qli_invoice_start_date) || '-'}</td>
       <td>{formatDateForDisplay(result.qli_line_item_service_start_date) || '-'}</td>
+      <td>{formatDateForDisplay(result.ili_recurring_from_date) || '-'}</td>
+      <td>{formatDateForDisplay(result.ili_recurring_to_date) || '-'}</td>
       <td>{result.ili_renewal_term ?? '-'}</td>
       <td>{result.qli_renewal_term ?? '-'}</td>
       <td>{result.ili_first_Price_increment_applicable_after ?? '-'}</td>
@@ -296,8 +311,32 @@ function ValidationResults({ results }) {
         if (status === 'Passed') rcSuccess++
         else rcFailed++
       }
+      if (!rc && isMovedToRC(r)) {
+        movedToRc++
+      }
     }
     return { qliSuccess, qliFailed, movedToRc, rcSuccess, rcFailed }
+  }, [results.validationResults])
+
+  /** Counts for lines that count as “moved to RC” (IBX, serial, description, item code, etc.). */
+  const movedToRcReasonBreakdown = useMemo(() => {
+    const rows = results.validationResults || []
+    const counts = new Map()
+    const getReasonKey = (r) => {
+      const stage = (r.quote_skip_stage || '').trim()
+      if (stage) return stage
+      const step = (r.validation_step || '').trim()
+      if (step) return step
+      return 'Other'
+    }
+    for (const r of rows) {
+      if (!isMovedToRC(r)) continue
+      const key = getReasonKey(r)
+      counts.set(key, (counts.get(key) || 0) + 1)
+    }
+    return Array.from(counts.entries())
+      .map(([reason, count]) => ({ reason, count }))
+      .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason))
   }, [results.validationResults])
 
   const filteredResults = useMemo(() => {
@@ -311,7 +350,7 @@ function ValidationResults({ results }) {
     } else if (filterStatus === 'qli-failed') {
       filtered = filtered.filter(r => isQLIValidation(r) && r.validation_result === 'Failed')
     } else if (filterStatus === 'moved-rc') {
-      filtered = filtered.filter(r => isRCValidation(r))
+      filtered = filtered.filter(r => isMovedToRC(r))
     } else if (filterStatus === 'rc-success') {
       filtered = filtered.filter(r => isRCValidation(r) && r.validation_result === 'Passed')
     } else if (filterStatus === 'rc-failed') {
@@ -337,7 +376,7 @@ function ValidationResults({ results }) {
         (r.qli_site_id || '').toString().toLowerCase().includes(search) ||
         (r.ili_description || '').toString().toLowerCase().includes(search) ||
         (r.qli_description || '').toString().toLowerCase().includes(search) ||
-        (r.ili_invoice_start_date || '').toString().toLowerCase().includes(search) ||
+        (r.ili_service_start_date || '').toString().toLowerCase().includes(search) ||
         (r.qli_invoice_start_date || '').toString().toLowerCase().includes(search) ||
         (r.qli_line_item_service_start_date || '').toString().toLowerCase().includes(search) ||
         (r.ili_renewal_term || '').toString().toLowerCase().includes(search) ||
@@ -353,6 +392,8 @@ function ValidationResults({ results }) {
         (r.validation_step || '').toString().toLowerCase().includes(search) ||
         (r.quote_skip_stage || '').toString().toLowerCase().includes(search) ||
         (r.quote_skip_reason || '').toString().toLowerCase().includes(search) ||
+        (r.quote_skip_item_code_remark || '').toString().toLowerCase().includes(search) ||
+        (r.quote_skip_description_remark || '').toString().toLowerCase().includes(search) ||
         (r.ili_billing_from || '').toString().toLowerCase().includes(search) ||
         (r.ili_billing_till || '').toString().toLowerCase().includes(search) ||
         (r.effective_lla != null ? String(r.effective_lla) : '').toLowerCase().includes(search) ||
@@ -442,6 +483,33 @@ function ValidationResults({ results }) {
           </div>
         </div>
       </div>
+
+      {movedToRcReasonBreakdown.length > 0 && (
+        <div className="moved-rc-breakdown" aria-label="Moved to rate card validation by reason">
+          <h3 className="moved-rc-breakdown-title">Moved to RC validation — by reason</h3>
+          <p className="moved-rc-breakdown-hint">
+            Each line is counted once. Reasons use quote skip stage (e.g. IBX, serial, item/description, charge description) or validation step when RC ran.
+          </p>
+          <div className="moved-rc-breakdown-table-wrap">
+            <table className="moved-rc-breakdown-table">
+              <thead>
+                <tr>
+                  <th scope="col">Reason</th>
+                  <th scope="col" className="moved-rc-breakdown-count-col">Count</th>
+                </tr>
+              </thead>
+              <tbody>
+                {movedToRcReasonBreakdown.map(({ reason, count }) => (
+                  <tr key={reason}>
+                    <td className="moved-rc-breakdown-reason">{reason}</td>
+                    <td className="moved-rc-breakdown-count">{count.toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       <div className="results-controls">
         <div className="filter-group">
@@ -537,7 +605,9 @@ function ValidationResults({ results }) {
               <tr>
                 <th>Row</th>
                 <th title="Which quote validation stage caused skip (e.g. Serial, IBX, Currency, Description)">Quote skipped at</th>
-                <th title="Stage + remarks why quote validation did not complete">Quote skip remarks</th>
+                <th title="Human-readable reason for quote skip (no duplicate stage text)">Quote skip (reason)</th>
+                <th title="Remark when skip is due to item code matching">Item code remark</th>
+                <th title="Remark when skip is due to charge description similarity">Description remark</th>
                 <th>ILI Serial Number</th>
                 <th>QLI Serial Number</th>
                 <th>ILI Number</th>
@@ -566,9 +636,12 @@ function ValidationResults({ results }) {
                 <th>ILI Desc Tokens</th>
                 <th>QLI Desc Tokens</th>
                 <th>Desc Match %</th>
-                <th>ILI Invoice Start Date</th>
+                <th title="Yes when QLI description/tokens show best CD score but CD did not reach pass threshold">QLI CD (best effort)</th>
+                <th>ILI SERVICE_START_DATE</th>
                 <th>QLI Invoice Start Date</th>
                 <th>QLI Line Item Service Start Date</th>
+                <th>ILI Recurring From Date</th>
+                <th>ILI Recurring To Date</th>
                 <th>ILI Renewal Term</th>
                 <th>QLI Renewal Term</th>
                 <th>ILI First Price Inc After</th>
@@ -633,8 +706,8 @@ function ExcelValidation() {
   const [validationProgress, setValidationProgress] = useState(0)
   const [priceTolerance, setPriceTolerance] = useState(5)
   const [qtyTolerance, setQtyTolerance] = useState(20)
+  const [useQuoteSerialFilter, setUseQuoteSerialFilter] = useState(true)
   const [useQuoteIbxFilter, setUseQuoteIbxFilter] = useState(true)
-  const [useQuoteCurrencyFilter, setUseQuoteCurrencyFilter] = useState(true)
   const deferredValidationResults = useDeferredValue(validationResults)
 
   useEffect(() => {
@@ -879,8 +952,8 @@ function ExcelValidation() {
     const options = {
       priceTolerance: priceTol,
       qtyTolerance: qtyTol,
+      useQuoteSerialFilter,
       useQuoteIbxFilter,
-      useQuoteCurrencyFilter,
       rateCardData: rateCardData || undefined,
       rateCardConfig: Array.isArray(config) ? config : undefined
     }
@@ -1070,16 +1143,16 @@ function ExcelValidation() {
               <label>
                 <input
                   type="checkbox"
-                  checked={useQuoteIbxFilter}
-                  onChange={(e) => setUseQuoteIbxFilter(e.target.checked)}
-                /> Apply quote IBX filter
+                  checked={useQuoteSerialFilter}
+                  onChange={(e) => setUseQuoteSerialFilter(e.target.checked)}
+                /> Apply quote serial filter
               </label>
               <label>
                 <input
                   type="checkbox"
-                  checked={useQuoteCurrencyFilter}
-                  onChange={(e) => setUseQuoteCurrencyFilter(e.target.checked)}
-                /> Apply quote currency filter
+                  checked={useQuoteIbxFilter}
+                  onChange={(e) => setUseQuoteIbxFilter(e.target.checked)}
+                /> Apply quote IBX filter
               </label>
             </div>
             <p className="tolerance-hint">E.g. 5% price tolerance: invoice unit price can be up to CUP × 1.05. 20% quantity: invoice qty can be up to quote qty × 1.20.</p>

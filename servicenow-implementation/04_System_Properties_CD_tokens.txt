@@ -1,0 +1,20 @@
+ServiceNow — CD (Charge Description) token configuration
+=========================================================
+
+Create two **string** system properties (same scope as your app, e.g. x_attm_doms):
+
+1) Name:  x_attm_doms.cd_tokens_json
+   Value: Full contents of csv-reader/src/data/tokens.json (single JSON object, minified or pretty).
+
+2) Name:  x_attm_doms.cd_value_tokens_json
+   Value: Full contents of csv-reader/src/data/valueTokens.json
+
+Optional quote settings:
+3) Name:  x_attm_doms.quote_use_currency_filter
+   Value: true/false
+   Default: false (currency is informational in remarks only)
+
+Notes:
+- Paste valid JSON only. If either property is empty or invalid JSON, validation falls back to word Jaccard (not full CD parity).
+- Very large tokens.json may exceed a single property limit on some instances. If import fails, split is not supported here — use a **Script Include** that returns JSON from an **Attachment**, or store long text in a **long** field / multiple properties (would require code change).
+- After changing tokens, clear cache by re-running validation (Script Include cache is per transaction).
